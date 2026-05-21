@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::path::PathBuf;
 
 // Используем легковесную, точную и отлично знающую русский язык модель
-const REPO_ID: &str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0";
+const REPO_ID: &str = "Qwen/Qwen2.5-1.5B-Instruct";
 const TOKENIZER_FILE: &str = "tokenizer.json";
 const CONFIG_FILE: &str = "config.json";
 

@@ -1,14 +1,13 @@
 use anyhow::Result;
 use std::fs::File;
 use candle_core::Device;
-use candle_transformers::models::llama::{Config, Llama as Model, Cache, LlamaConfig};
+use candle_transformers::models::qwen2::{Config, ModelForCausalLM};
 use crate::loader::ModelFiles;
 use tokenizers::Tokenizer;
 use candle_transformers::generation::LogitsProcessor;
 
 pub struct InferenceEngine {
-    pub model: Model,
-    pub config: Config,
+    pub model: ModelForCausalLM,
     pub device: Device,
 }
 
@@ -17,28 +16,26 @@ impl InferenceEngine {
         println!("Загрузка конфигурации модели...");
         let config_file = File::open(&files.config)?;
         
-        let llama_config: LlamaConfig = serde_json::from_reader(config_file)?;
-        let config = llama_config.into_config(false);
+        let config: Config = serde_json::from_reader(&config_file)?;
 
         let safetensors = unsafe { 
             candle_core::safetensors::MmapedSafetensors::new(&files.weights)? 
         };
-        
+
+        println!("Использование безопасного формата вычислений: F32");
         let vb = candle_nn::VarBuilder::from_backend(
             Box::new(safetensors),
-            candle_core::DType::F16,
+            candle_core::DType::F32,
             device.clone()
         );
 
-        println!("Инициализация architecture Llama...");
-        // ИСПРАВЛЕНИЕ: Используем load вместо new, как просит компилятор
-        let model = Model::load(vb, &config)?;
+        println!("Инициализация architecture Qwen2...");
+        let model = ModelForCausalLM::new(&config, vb)?;
 
         println!("Модель успешно развернута в памяти и готова к генерации.");
 
         Ok(Self {
             model,
-            config,
             device: device.clone(),
         })
     }
@@ -49,16 +46,18 @@ impl InferenceEngine {
             .map_err(|e| anyhow::anyhow!("Ошибка загрузки токенизатора: {}", e))?;
 
         // Шаблон для TinyLlama
-        let chat_prompt = format!("<|user|>\n{}</s>\n<|assistant|>\n", prompt);
+        let formatted_prompt = format!(
+            "<|im_start|>system\nТы полезный AI-ассистент.<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+            prompt
+        );
 
-        let tokens = tokenizer.encode(chat_prompt.as_str(), false)
+        let tokens = tokenizer.encode(formatted_prompt.as_str(), false)
             .map_err(|e| anyhow::anyhow!("Ошибка кодирования: {}", e))?;
         let mut tokens_queue = tokens.get_ids().to_vec();
 
         let mut logits_processor = LogitsProcessor::new(299792458, Some(0.7), Some(0.9));
-        let eos_token = tokenizer.token_to_id("</s>").unwrap_or(2);
+        let eos_token = 151645_u32;
 
-        let mut cache = Cache::new(true, candle_core::DType::F16, &self.config, &self.device)?;
         let mut start_pos = 0;
 
         println!("\nОтвет ИИ: ");
@@ -70,7 +69,14 @@ impl InferenceEngine {
             let input = candle_core::Tensor::new(single_token.as_slice(), &self.device)?
                 .unsqueeze(0)?; // [1, 1]
 
-            let logits = self.model.forward(&input, start_pos, &mut cache)?;
+            let logits = self.model.forward(&input, start_pos)?;
+            let logits = if logits.rank() == 3 {
+                logits.get(0)?.get(logits.dim(1)? - 1)?
+            } else if logits.rank() == 2 {
+                logits.get(0)?
+            } else {
+                logits
+            }.contiguous()?;
             
             // Если это самый последний токен промпта, нам нужно вытащить его логиты для генерации
             if i == tokens_queue.len() - 1 {
@@ -82,7 +88,7 @@ impl InferenceEngine {
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
                 
                 // Крутим цикл генерации новых токенов
-                for _ in 0..100 {
+                for _ in 0..200 {
                     if next_token == eos_token {
                         break;
                     }
@@ -103,8 +109,15 @@ impl InferenceEngine {
                     let input = candle_core::Tensor::new(&[next_token], &self.device)?
                         .unsqueeze(0)?;
                     
-                    let logits = self.model.forward(&input, start_pos, &mut cache)?;
-                    let logits = logits.squeeze(0)?.contiguous()?;
+                let logits = self.model.forward(&input, start_pos)?;
+                let logits = if logits.rank() == 3 {
+                    logits.get(0)?.get(logits.dim(1)? - 1)?
+                } else if logits.rank() == 2 {
+                    logits.get(0)?
+                } else {
+                    logits
+                }.contiguous()?;
+                
                     next_token = logits_processor.sample(&logits)?;
                 }
             } else {

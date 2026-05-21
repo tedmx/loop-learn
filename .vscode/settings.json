@@ -1,0 +1,21 @@
+{
+  "rust-analyzer.check.overrideCommand": [
+    "docker",
+    "run",
+    "--rm",
+    "--gpus",
+    "all",
+    "-v",
+    "${workspaceFolder}:/usr/src/app",
+    "-v",
+    "${userHome}/.cargo/registry:/root/.cargo/registry",
+    "-v",
+    "${userHome}/.cargo/git:/root/.cargo/git",
+    "-w",
+    "/usr/src/app",
+    "loop-env",
+    "cargo",
+    "check",
+    "--message-format=json"
+  ]
+}
