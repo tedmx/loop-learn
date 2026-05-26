@@ -1420,6 +1420,7 @@ dependencies = [
  "candle-transformers",
  "hf-hub",
  "memmap2",
+ "serde",
  "serde_json",
  "tokenizers",
 ]

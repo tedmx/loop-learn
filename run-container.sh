@@ -15,11 +15,13 @@ fi
 
 echo "=== Запуск проекта loop-learn в изолированном контейнере... ==="
 
-# Запуск контейнера с пробросом GPU и кэшированием зависимостей/моделей
+mkdir -p storage;
+
+# Запуск контейнера с пробросом аргументов
 docker run --gpus all -it --rm \
   -v "$(pwd)":/usr/src/app \
   -v "$HOME/.cargo/registry:/root/.cargo/registry" \
   -v "$HOME/.cargo/git:/root/.cargo/git" \
   -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
   -w /usr/src/app \
-  "$IMAGE_NAME" cargo run
+  "$IMAGE_NAME" cargo run -- "$@"
