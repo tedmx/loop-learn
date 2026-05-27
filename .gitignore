@@ -1,2 +1,4 @@
 /target
 *.diff
+*.zip
+chat_history.json

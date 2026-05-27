@@ -1,3 +1,6 @@
+use candle_core::{Tensor, Device, DType};
+use candle_nn::{VarBuilder};
+use candle_transformers::models::bert::{BertModel, Config};
 use serde::{Serialize, Deserialize};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -54,74 +57,147 @@ impl ChatSession {
             role: role.to_string(),
             content: content.to_string(),
         });
+        // Держим историю компактной, удаляя старые сообщения, если превышен лимит
+        if self.messages.len() > 20 {
+            self.messages.drain(0..self.messages.len() - 20);
+        };
     }
+}
 
-    // Сборка всей истории в один ChatML-текст для прогрева кэша
-    pub fn to_chatml(&self) -> String {
-        let mut result = String::new();
+// Структура для хранения проиндексированного блока знаний
+pub struct KnowledgeDocument {
+    pub text: String,
+    pub embedding: Tensor,
+}
 
-        result.push_str("<|im_start|>system\nТы полезный AI-ассистент. Ты внимательно анализируешь ВСЮ цепочку сообщений ниже и помнишь абсолютно каждый факт из прошлых тем обсуждения.<|im_end|>\n\n");
+pub struct VectorRegistry {
+    pub documents: Vec<KnowledgeDocument>,
+    pub bert: BertModel,
+    pub tokenizer: tokenizers::Tokenizer,
+    pub device: Device,
+}
 
-        for msg in &self.messages {
-            result.push_str(&format!(
-                "<|im_start|>{}\n{}<|im_end|>\n",
-                msg.role, msg.content
-            ));
-        }
+impl VectorRegistry {
+    // Индексируем текстовый файл, превращая каждый блок в вектор
+    pub fn bootstrap(
+        knowledge_path: &Path,
+        model_path: &Path,
+        config_path: &Path,
+        tokenizer_path: &Path,
+        device: &Device,
+    ) -> anyhow::Result<Self> {
+        let config_file = File::open(config_path)?;
+        let config: Config = serde_json::from_reader(&config_file)?;
         
-        result
+        let safetensors = unsafe { candle_core::safetensors::MmapedSafetensors::new(model_path)? };
+        let vb = VarBuilder::from_backend(Box::new(safetensors), DType::F32, device.clone());
+        let bert = BertModel::load(vb, &config)?;
+        
+        let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path)
+            .map_err(|e| anyhow::anyhow!("Ошибка загрузки токенизатора эмбеддингов: {}", e))?;
+
+        let mut documents = Vec::new();
+
+        if knowledge_path.exists() {
+            let file = File::open(knowledge_path)?;
+            let reader = std::io::BufReader::new(file);
+            use std::io::BufRead;
+
+            let mut current_section = String::new();
+
+            for line in reader.lines() {
+                let line = line?.trim().to_string();
+                if line.is_empty() {
+                    continue;
+                }
+
+                // Если строка — это заголовок секции, запоминаем её и НЕ индексируем отдельно
+                if line.starts_with("===") && line.ends_with("===") {
+                    current_section = line.replace("===", "").trim().to_string();
+                    continue;
+                }
+
+                // К каждому контентному абзацу подмешиваем имя его секции для идеального векторного поиска
+                let full_chunk_text = if !current_section.is_empty() {
+                    format!("[Section: {}] {}", current_section, line)
+                } else {
+                    line
+                };
+
+                // Генерируем эмбеддинг для склеенного чанка
+                let tokens = tokenizer.encode(full_chunk_text.as_str(), true)
+                    .map_err(|e| anyhow::anyhow!("Tokenizer error: {}", e))?;
+                let token_ids = tokens.get_ids();
+                let input_ids = Tensor::new(token_ids, &device)?.unsqueeze(0)?;
+                let token_type_ids = Tensor::zeros_like(&input_ids)?;
+
+                let embeddings = bert.forward(&input_ids, &token_type_ids, None)?;
+                let embedding = embeddings.mean_keepdim(1)?.squeeze(1)?.squeeze(0)?;
+
+                // Сохраняем в документ именно полный текст с фактами
+                documents.push(KnowledgeDocument {
+                    text: full_chunk_text,
+                    embedding,
+                });
+            }
+        }
+
+        Ok(Self { 
+            documents, 
+            bert, 
+            tokenizer, 
+            device: device.clone() 
+        })
     }
-}
 
-// Функция для поиска наиболее релевантного блока знаний по ключевым словам
-pub fn find_relevant_context(query: &str) -> Option<String> {
-    let knowledge_path = std::path::Path::new("storage/knowledge.txt");
-    if !knowledge_path.exists() {
-        return None;
-    }
 
-    if let Ok(content) = std::fs::read_to_string(knowledge_path) {
-        // Разбираем файл на отдельные смысловые блоки
-        let blocks: Vec<&str> = content.split("===").collect();
-        let query_lower = query.to_lowercase();
-        // Разбиваем запрос на отдельные слова для поиска пересечений
-        let words: Vec<&str> = query_lower.split_whitespace().collect();
+    // Высокоуровневый семантический поиск: принимает строку текста и возвращает контекст
+    pub fn find_relevant_context(&mut self, query: &str) -> Result<Option<String>> {
+        // 1. Получаем эмбеддинг для запроса пользователя
+        let tokens = self.tokenizer.encode(query, true)
+            .map_err(|e| anyhow::anyhow!("Query tokenizer error: {}", e))?;
+        let token_ids = tokens.get_ids();
+        
+        let input_ids = Tensor::new(token_ids, &self.device)?.unsqueeze(0)?;
+        let token_type_ids = Tensor::zeros_like(&input_ids)?;
+        let embeddings = self.bert.forward(&input_ids, &token_type_ids, None)?;
+        let query_vector = embeddings.mean_keepdim(1)?.squeeze(1)?.squeeze(0)?;
 
-        let mut best_block = None;
-        let mut max_matches = 0;
+        // 2. Считаем косинусное сходство со всеми документами
+        let mut best_text = None;
+        let mut max_similarity = -1.0;
 
-        for block in blocks {
-            let block_lower = block.to_lowercase();
-            let mut matches = 0;
+        println!("\n=== [DEBUG] СТАРТ ПОИСКА ПО БАЗЕ ЗНАНИЙ ===");
+        println!("Запрос: '{}'", query);
+
+        for (idx, doc) in self.documents.iter().enumerate() {
+            let dot_product = (&doc.embedding * &query_vector)?.sum_all()?.to_scalar::<f32>()?;
+            let norm_a = doc.embedding.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
+            let norm_b = query_vector.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
             
-            for word in &words {
-                // Игнорируем слишком короткие слова (предлоги, союзы), чтобы избежать ложных срабатываний
-                if word.len() > 3 && block_lower.contains(word) {
-                    matches += 1;
-                }
-            }
+            let denominator = norm_a * norm_b;
+            let similarity = if denominator > 1e-6 {
+                dot_product / denominator
+            } else {
+                0.0
+            };
 
-            // Если в этом блоке больше совпадений, чем в предыдущих, запоминаем его
-            if matches > max_matches {
-                max_matches = matches;
-                best_block = Some(block.to_string());
+            // Выводим имя блока (первые 35 символов) и его честный скор
+            let short_title: String = doc.text.chars().take(35).collect();
+            println!("  -> Блок №{} [{}...]: similarity = {:.4}", idx, short_title.replace('\n', " "), similarity);
+
+            if similarity > max_similarity {
+                max_similarity = similarity;
+                best_text = Some(doc.text.clone());
             }
         }
 
-        // Если нашли блок, в котором совпало хотя бы одно значимое ключевое слово
-        if max_matches > 0 {
-            if let Some(mut block_str) = best_block {
-                // Очищаем от служебных заголовков, если они остались в начале строки
-                if let Some(index) = block_str.find('\n') {
-                    if block_str[..index].contains(':') || block_str[..index].trim().is_empty() {
-                        block_str = block_str[index..].to_string();
-                    }
-                }
-                return Some(block_str.trim().to_string());
-            }
+        println!("-> Vector search completed. Max similarity score: {:.4}", max_similarity);
+
+        if max_similarity > 0.45 {
+            Ok(best_text)
+        } else {
+            Ok(None)
         }
     }
-
-    None
 }
-

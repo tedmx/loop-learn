@@ -1,29 +1,24 @@
-use candle_core::Device;
 use anyhow::Result;
 use std::path::Path;
 
 // Декларируем изолированные компоненты нашего замкнутого цикла (Feedback Loop)
 mod loader;    // Загрузка и кэширование весов
 mod inference; // Быстрый локальный инференс
-mod train;     // Фоновое дообучение
 mod storage;   // Память и буфер воспроизведения
 
 use storage::ChatSession;
 
 fn main() -> Result<()> {
-    let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
-    
-    println!("=== Инициализация системы loop-learn ===");
-    println!("Выбранное устройство вычислений: {:?}", device);
-    
-    // Вызываем наш загрузчик. Оператор `?` вернет ошибку, если что-то пойдет не так (например, пропадет интернет)
-    let env_files = loader::ModelFiles::download()?;
+    let env_files = crate::loader::ModelFiles::download()?; 
+    let device = candle_core::Device::new_cuda(0) 
+        .unwrap_or(candle_core::Device::Cpu);
+    let mut engine = crate::inference::InferenceEngine::new(&env_files, &device)?;
 
-    let mut engine = inference::InferenceEngine::new(&env_files, &device)?;
+    // Создаем объект токенизатора, который будет доступен во всей функции main
+    let tokenizer = tokenizers::Tokenizer::from_file(&env_files.tokenizer)
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     let args: Vec<String> = std::env::args().collect();
-    
-    // Ищем позицию флага -p и берем значение за ним
     let prompt_arg = if let Some(pos) = args.iter().position(|x| x == "-p") {
         args.get(pos + 1).map(|s| s.as_str())
     } else {
@@ -34,23 +29,51 @@ fn main() -> Result<()> {
         let history_path = Path::new("storage/chat_history.json");
         let mut session = ChatSession::load_or_create(history_path)?;
 
-        let context_info = crate::storage::find_relevant_context(prompt_str);
+        // --- ИЗОЛИРОВАННЫЙ БЛОК ДЛЯ СЕМАНТИЧЕСКОГО ПОИСКА ---
+        let context_info = {
+            let embed_files = crate::loader::EmbeddingFiles::download_or_get()?;
+            let knowledge_path = std::path::Path::new("storage/knowledge.txt");
 
-       let execution_prompt = if let Some(ref facts) = context_info {
-            println!("Найден релевантный контекст в локальной базе знаний. Инжектируем факты...");
+            println!("Инициализация векторного реестра Базы Знаний...");
+            let mut registry = crate::storage::VectorRegistry::bootstrap(
+                knowledge_path,
+                &embed_files.weights,
+                &embed_files.config,
+                &embed_files.tokenizer,
+                &candle_core::Device::Cpu, // используем тот же девайс, что и у основного движка
+            )?;
+
+            let res = registry.find_relevant_context(prompt_str)?;
+
+            res
+        };
+
+        let system_instruction = "You are a helpful local AI assistant. If the provided knowledge base context contains information regarding the user's question, prioritize using it for an accurate answer. If there is no context or the context lacks information, answer to the best of your own general knowledge.";
+
+        let execution_prompt = if let Some(ref facts) = context_info {
+            println!("Context found, length: {}", facts.len());
             format!(
-                "Контекст из базы знаний:\n{}\n\nИспользуя этот контекст, ответь на вопрос: {}", 
-                facts, 
+                "<|im_start|>system\n{} Here is the context from the knowledge base:\n{}\n<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+                system_instruction,
+                facts,
                 prompt_str
             )
         } else {
-            prompt_str.to_string()
+            println!("Context NOT found, using model's free thinking");
+            format!(
+                "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+                system_instruction,
+                prompt_str
+            )
         };
 
+        println!("Текст execution_prompt полностью:\n---\n{}\n---", execution_prompt);
+        
         session.add_message("user", prompt_str);
 
+        println!("Передаем управление в engine.generate...");
         // Запускаем движок генерации
-        if let Err(e) = engine.generate(&mut session, &execution_prompt, &env_files.tokenizer) {
+        if let Err(e) = engine.generate(&mut session, &execution_prompt, &tokenizer) {
             println!("Ошибка генерации: {:?}", e);
         } else {
             // Сбрасываем сдвиг позиций и сохраняем чистую историю диалога
