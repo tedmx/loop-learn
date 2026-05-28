@@ -37,8 +37,8 @@ impl ModelFiles {
 
         println!("Файлы модели не найдены локально. Подключение к Hugging Face для скачивания...");
         let api = ApiBuilder::new()
-        .with_progress(true)
-        .build()?;
+            .with_progress(true)
+            .build()?;
         let repo = api.model(REPO_ID.to_string());
 
         let tokenizer = repo.get(TOKENIZER_FILE)?;
@@ -47,10 +47,47 @@ impl ModelFiles {
 
         println!("Все необходимые файлы модели успешно загружены.");
         return Ok(Self {
-        tokenizer,
-        config,
-        weights,
+            tokenizer,
+            config,
+            weights,
         });
+    }
+
+    pub fn download_tokenizer_only(repo_id: &str) -> Result<std::path::PathBuf> {
+        let cache = hf_hub::Cache::default();
+        let repo_cache = cache.repo(hf_hub::Repo::new(repo_id.to_string(), hf_hub::RepoType::Model));
+
+        if let Some(tok_path) = repo_cache.get("tokenizer.json") {
+            return Ok(tok_path);
+        };
+
+        let api = ApiBuilder::new()
+            .with_progress(true)
+            .build()?;
+        let repo = api.model(repo_id.to_string());
+        let tok_path = repo.get("tokenizer.json")?;
+        Ok(tok_path)
+    }
+
+    pub fn download_gguf(repo_id: &str, gguf_file: &str) -> Result<std::path::PathBuf> {
+        println!("Проверка локального кэша для GGUF модели: {}/{}", repo_id, gguf_file);
+        let cache = hf_hub::Cache::default();
+        let repo_cache = cache.repo(hf_hub::Repo::new(repo_id.to_string(), hf_hub::RepoType::Model));
+    
+        if let Some(local_path) = repo_cache.get(gguf_file) {
+            println!("GGUF файл верифицирован и готов к работе.");
+            return Ok(local_path);
+        };
+    
+        println!("GGUF файл не найден локально. Подключение к Hugging Face для загрузки...");
+        let api = ApiBuilder::new()
+            .with_progress(true)
+            .build()?;
+        let repo = api.model(repo_id.to_string());
+        let downloaded_path = repo.get(gguf_file)?;
+        
+        println!("GGUF файл успешно загружен.");
+        Ok(downloaded_path)
     }
 }
 
@@ -85,22 +122,22 @@ impl EmbeddingFiles {
 
         println!("Файлы эмбеддингов не найдены локально. Подключение к Hugging Face для скачивания...");
         let api = ApiBuilder::new()
-        .with_progress(true)
-        .build()?;
+            .with_progress(true)
+            .build()?;
         let repo = api.model(repo_id.to_string());
 
         let config = repo.get("config.json")
-        .map_err(|e| anyhow::anyhow!("Не удалось загрузить config.json для эмбеддингов: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Не удалось загрузить config.json для эмбеддингов: {}", e))?;
         let weights = repo.get("model.safetensors")
-        .map_err(|e| anyhow::anyhow!("Не удалось загрузить model.safetensors для эмбеддингов: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Не удалось загрузить model.safetensors для эмбеддингов: {}", e))?;
         let tokenizer = repo.get("tokenizer.json")
-        .map_err(|e| anyhow::anyhow!("Не удалось загрузить tokenizer.json для эмбеддингов: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Не удалось загрузить tokenizer.json для эмбеддингов: {}", e))?;
 
         println!("Все необходимые файлы эмбеддингов успешно загружены.");
         return Ok(Self {
-        config,
-        weights,
-        tokenizer,
+            config,
+            weights,
+            tokenizer,
         });
     }
 }

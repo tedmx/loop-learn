@@ -9,16 +9,40 @@ mod storage;   // Память и буфер воспроизведения
 use storage::ChatSession;
 
 fn main() -> Result<()> {
-    let env_files = crate::loader::ModelFiles::download()?; 
+    let args: Vec<String> = std::env::args().collect();
+    
     let device = candle_core::Device::new_cuda(0) 
         .unwrap_or(candle_core::Device::Cpu);
-    let mut engine = crate::inference::InferenceEngine::new(&env_files, &device)?;
+
+    // Проверяем наличие флага запуска GGUF версии
+    let use_gguf = args.iter().any(|x| x == "--gguf");
+
+    let (mut engine, tokenizer_path) = if use_gguf {
+        // Указываем репозиторий с квантованными моделями и нужный нам файл
+        let gguf_repo = "Qwen/Qwen2.5-3B-Instruct-GGUF";
+        let gguf_filename = "qwen2.5-3b-instruct-q4_k_m.gguf";
+    
+        let gguf_path = crate::loader::ModelFiles::download_gguf(gguf_repo, gguf_filename)?;
+        // Скачиваем токенизатор от базовой модели напрямую, минуя тяжелые safetensors
+        let tok_path = crate::loader::ModelFiles::download_tokenizer_only("Qwen/Qwen2.5-1.5B-Instruct")?;
+    
+        let eng = crate::inference::InferenceEngine::new_gguf(&gguf_path, &device)?;
+        (eng, tok_path)
+    } else {
+        let dtype = if args.iter().any(|x| x == "--f16") {
+            candle_core::DType::BF16
+        } else {
+            candle_core::DType::F32
+        };
+        let env_files = crate::loader::ModelFiles::download()?; 
+        let eng = crate::inference::InferenceEngine::new(&env_files, &device, dtype)?;
+        (eng, env_files.tokenizer)
+    };
 
     // Создаем объект токенизатора, который будет доступен во всей функции main
-    let tokenizer = tokenizers::Tokenizer::from_file(&env_files.tokenizer)
+    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!(e))?;
 
-    let args: Vec<String> = std::env::args().collect();
     let prompt_arg = if let Some(pos) = args.iter().position(|x| x == "-p") {
         args.get(pos + 1).map(|s| s.as_str())
     } else {
