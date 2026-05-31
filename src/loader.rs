@@ -1,6 +1,5 @@
 use anyhow::Result;
 use std::path::PathBuf;
-use hf_hub::api::sync::ApiBuilder;
 
 // Используем легковесную, точную и отлично знающую русский язык модель
 const REPO_ID: &str = "Qwen/Qwen2.5-1.5B-Instruct";
@@ -36,9 +35,12 @@ impl ModelFiles {
         };
 
         println!("Файлы модели не найдены локально. Подключение к Hugging Face для скачивания...");
-        let api = ApiBuilder::new()
-            .with_progress(true)
-            .build()?;
+        let mut builder = hf_hub::api::sync::ApiBuilder::new();
+        if let Ok(token) = std::env::var("HF_TOKEN") {
+            builder = builder.with_token(Some(token));
+        }
+        let api = builder.with_progress(true).build()?;
+
         let repo = api.model(REPO_ID.to_string());
 
         let tokenizer = repo.get(TOKENIZER_FILE)?;
@@ -61,9 +63,12 @@ impl ModelFiles {
             return Ok(tok_path);
         };
 
-        let api = ApiBuilder::new()
-            .with_progress(true)
-            .build()?;
+        let mut builder = hf_hub::api::sync::ApiBuilder::new();
+        if let Ok(token) = std::env::var("HF_TOKEN") {
+            builder = builder.with_token(Some(token));
+        }
+        let api = builder.with_progress(true).build()?;
+
         let repo = api.model(repo_id.to_string());
         let tok_path = repo.get("tokenizer.json")?;
         Ok(tok_path)
@@ -80,9 +85,12 @@ impl ModelFiles {
         };
     
         println!("GGUF файл не найден локально. Подключение к Hugging Face для загрузки...");
-        let api = ApiBuilder::new()
-            .with_progress(true)
-            .build()?;
+        let mut builder = hf_hub::api::sync::ApiBuilder::new();
+        if let Ok(token) = std::env::var("HF_TOKEN") {
+            builder = builder.with_token(Some(token));
+        }
+        let api = builder.with_progress(true).build()?;
+
         let repo = api.model(repo_id.to_string());
         let downloaded_path = repo.get(gguf_file)?;
         
@@ -121,9 +129,13 @@ impl EmbeddingFiles {
         };
 
         println!("Файлы эмбеддингов не найдены локально. Подключение к Hugging Face для скачивания...");
-        let api = ApiBuilder::new()
-            .with_progress(true)
-            .build()?;
+        
+        let mut builder = hf_hub::api::sync::ApiBuilder::new();
+        if let Ok(token) = std::env::var("HF_TOKEN") {
+            builder = builder.with_token(Some(token));
+        }
+        let api = builder.with_progress(true).build()?;
+
         let repo = api.model(repo_id.to_string());
 
         let config = repo.get("config.json")

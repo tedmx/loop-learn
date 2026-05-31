@@ -1,45 +1,80 @@
 use anyhow::Result;
 use std::path::Path;
 
-// Декларируем изолированные компоненты нашего замкнутого цикла (Feedback Loop)
-mod loader;    // Загрузка и кэширование весов
-mod inference; // Быстрый локальный инференс
-mod storage;   // Память и буфер воспроизведения
+mod loader; 
+mod inference;
+mod storage;
+mod presets;
 
 use storage::ChatSession;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    
-    let device = candle_core::Device::new_cuda(0) 
-        .unwrap_or(candle_core::Device::Cpu);
 
-    // Проверяем наличие флага запуска GGUF версии
-    let use_gguf = args.iter().any(|x| x == "--gguf");
+    // Trigger help output if requested
+    if args.iter().any(|x| x == "--list-presets") {
+        crate::presets::list_presets();
+        return Ok(());
+    }
 
-    let (mut engine, tokenizer_path) = if use_gguf {
-        // Указываем репозиторий с квантованными моделями и нужный нам файл
-        let gguf_repo = "Qwen/Qwen2.5-3B-Instruct-GGUF";
-        let gguf_filename = "qwen2.5-3b-instruct-q4_k_m.gguf";
-    
-        let gguf_path = crate::loader::ModelFiles::download_gguf(gguf_repo, gguf_filename)?;
-        // Скачиваем токенизатор от базовой модели напрямую, минуя тяжелые safetensors
-        let tok_path = crate::loader::ModelFiles::download_tokenizer_only("Qwen/Qwen2.5-1.5B-Instruct")?;
-    
-        let eng = crate::inference::InferenceEngine::new_gguf(&gguf_path, &device)?;
-        (eng, tok_path)
-    } else {
-        let dtype = if args.iter().any(|x| x == "--f16") {
-            candle_core::DType::BF16
+    // Resolve targeted configuration profile, fallback to qwen-3b-q4
+    let preset_name = if let Some(pos) = args.iter().position(|x| x == "--preset") {
+        if pos + 1 < args.len() {
+            args[pos + 1].as_str()
         } else {
-            candle_core::DType::F32
-        };
-        let env_files = crate::loader::ModelFiles::download()?; 
-        let eng = crate::inference::InferenceEngine::new(&env_files, &device, dtype)?;
-        (eng, env_files.tokenizer)
+            anyhow::bail!("CLI Error: Missing configuration profile name after --preset flag");
+        }
+    } else {
+        "qwen-3b-q4"
     };
 
-    // Создаем объект токенизатора, который будет доступен во всей функции main
+    // Locate requested configuration within predefined model layout matrix
+    let selected_preset = crate::presets::PRESETS
+        .iter()
+        .find(|p| p.name == preset_name)
+        .ok_or_else(|| anyhow::anyhow!("CLI Error: Profile '{}' not found. Execute with --list-presets to view choices.", preset_name))?;
+
+    // Bind execution context to target GPU index (0 for 6GB target, 1 for 12GB runtime)
+    let cuda_index = if selected_preset.vram_limit == "12 GB" { 1 } else { 0 };
+    let device = candle_core::Device::new_cuda(cuda_index)
+        .unwrap_or(candle_core::Device::Cpu);
+
+    let (mut engine, tokenizer_path) = match selected_preset.kind {
+        crate::presets::ModelKind::Gguf => {
+            let repo = selected_preset.repo_id;
+            let filename = selected_preset.filename
+                .ok_or_else(|| anyhow::anyhow!("Internal Error: Target GGUF filename payload is empty"))?;
+            
+            let gguf_path = crate::loader::ModelFiles::download_gguf(repo, filename)?;
+            let tok_path = crate::loader::ModelFiles::download_tokenizer_only(selected_preset.tokenizer_repo)?;
+            
+            // Resolve runtime architecture target from the preset name prefix
+            let architecture = if selected_preset.name.starts_with("phi") {
+                "phi3"
+            } else if selected_preset.name.starts_with("llama") {
+                "llama"
+            } else {
+                "qwen"
+            };
+
+            let eng = crate::inference::InferenceEngine::new_gguf(
+                &gguf_path, 
+                &device, 
+                architecture,
+                selected_preset.eos_token,
+                selected_preset.template_kind,
+            )?;
+
+            (eng, tok_path)
+        },
+        crate::presets::ModelKind::Standard => {
+            let env_files = crate::loader::ModelFiles::download()?; 
+            let eng = crate::inference::InferenceEngine::new(&env_files, &device, selected_preset.dtype)?;
+            (eng, env_files.tokenizer)
+        }
+    };
+
+    // Instantiate tokenizer instance using isolated local path setup
     let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!(e))?;
 
@@ -64,7 +99,7 @@ fn main() -> Result<()> {
                 &embed_files.weights,
                 &embed_files.config,
                 &embed_files.tokenizer,
-                &candle_core::Device::Cpu, // используем тот же девайс, что и у основного движка
+                &device,
             )?;
 
             let res = registry.find_relevant_context(prompt_str)?;
