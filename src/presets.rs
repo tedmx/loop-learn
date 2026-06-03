@@ -18,10 +18,14 @@ pub struct PresetInfo {
     pub tokenizer_repo: &'static str,
     pub eos_token: u32,
     pub template_kind: &'static str, 
+    pub temperature: f64,
+    pub top_p: f64,
+    pub repetition_penalty: f32,
 }
 
 pub const PRESETS: &[PresetInfo] = &[
     // --- 6 GB VRAM Profiles (Laptop RTX 3060) ---
+
     PresetInfo {
         name: "qwen-1.5b-bf16",
         description: "Qwen2.5-1.5B Standard (Optimized precision BF16 execution)",
@@ -33,6 +37,9 @@ pub const PRESETS: &[PresetInfo] = &[
         tokenizer_repo: "Qwen/Qwen2.5-1.5B-Instruct",
         eos_token: 151645,
         template_kind: "chatml",
+        temperature: 0.7,
+        top_p: 0.9,
+        repetition_penalty: 1.1,
     },
     PresetInfo {
         name: "qwen-3b-q4",
@@ -45,6 +52,9 @@ pub const PRESETS: &[PresetInfo] = &[
         tokenizer_repo: "Qwen/Qwen2.5-3B-Instruct",
         eos_token: 151645,
         template_kind: "chatml",
+        temperature: 0.7,
+        top_p: 0.9,
+        repetition_penalty: 1.1,
     },
     PresetInfo {
         name: "qwen-3b-q8",
@@ -57,6 +67,9 @@ pub const PRESETS: &[PresetInfo] = &[
         tokenizer_repo: "Qwen/Qwen2.5-3B-Instruct",
         eos_token: 151645,
         template_kind: "chatml",
+        temperature: 0.7,
+        top_p: 0.9,
+        repetition_penalty: 1.1,
     },
     PresetInfo {
         name: "phi-3-mini-q4",
@@ -69,9 +82,16 @@ pub const PRESETS: &[PresetInfo] = &[
         tokenizer_repo: "microsoft/Phi-3-mini-4k-instruct",
         eos_token: 32000, // Standard Phi-3 <|end|> token ID
         template_kind: "phi3",
+        temperature: 0.7,
+        top_p: 0.85,
+        repetition_penalty: 1.1,
     },
+
     // --- 12 GB VRAM Profiles (RTX 2060 Super) ---
-    PresetInfo {
+
+    // Temporarily disabled due to strict Meta Hugging Face repository gated access restrictions.
+    // Uncomment only if explicit explicit user authorization and token access are cleared.
+    /* PresetInfo {
         name: "llama-3.1-8b-q8",
         description: "Llama-3.1-8B GGUF (Meta's industry standard, high-fidelity 8-bit, multilingual)",
         vram_limit: "12 GB",
@@ -82,7 +102,10 @@ pub const PRESETS: &[PresetInfo] = &[
         tokenizer_repo: "meta-llama/Llama-3.1-8B-Instruct",
         eos_token: 128009, // Llama 3.1 <|eot_id|> token ID
         template_kind: "llama3",
-    },
+        temperature: 0.7,
+        top_p: 0.9,
+        repetition_penalty: 1.1,
+    }, */
     PresetInfo {
         name: "qwen-14b-q4",
         description: "Qwen2.5-14B GGUF (Heavyweight 4-bit, maximum knowledge capacity)",
@@ -94,6 +117,9 @@ pub const PRESETS: &[PresetInfo] = &[
         tokenizer_repo: "Qwen/Qwen2.5-14B-Instruct",
         eos_token: 151645,
         template_kind: "chatml",
+        temperature: 0.7,
+        top_p: 0.9,
+        repetition_penalty: 1.1,
     },
 ];
 

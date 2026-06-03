@@ -28,7 +28,6 @@ fn main() -> Result<()> {
         "qwen-3b-q4"
     };
 
-    // Locate requested configuration within predefined model layout matrix
     let selected_preset = crate::presets::PRESETS
         .iter()
         .find(|p| p.name == preset_name)
@@ -63,13 +62,25 @@ fn main() -> Result<()> {
                 architecture,
                 selected_preset.eos_token,
                 selected_preset.template_kind,
+                selected_preset.temperature,
+                selected_preset.top_p,
+                selected_preset.repetition_penalty,
             )?;
 
             (eng, tok_path)
         },
         crate::presets::ModelKind::Standard => {
             let env_files = crate::loader::ModelFiles::download()?; 
-            let eng = crate::inference::InferenceEngine::new(&env_files, &device, selected_preset.dtype)?;
+            let eng = crate::inference::InferenceEngine::new(
+                &env_files,
+                &device,
+                selected_preset.dtype,
+                selected_preset.eos_token,
+                selected_preset.template_kind,
+                selected_preset.temperature,
+                selected_preset.top_p,
+                selected_preset.repetition_penalty,
+            )?;
             (eng, env_files.tokenizer)
         }
     };

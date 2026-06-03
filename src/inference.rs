@@ -22,22 +22,49 @@ pub struct InferenceEngine {
     pub dtype: candle_core::DType,
     pub eos_token: u32,
     pub template_kind: String,
+    pub temperature: f64,
+    pub top_p: f64,
+    pub repetition_penalty: f32,
 }
 
 impl InferenceEngine {
-    pub fn new(files: &ModelFiles, device: &Device, dtype: candle_core::DType) -> Result<Self> {
+    pub fn new(
+        files: &ModelFiles,
+        device: &Device,
+        dtype: candle_core::DType,
+        _eos_token: u32,
+        _template_kind: &str,
+        temperature: f64,
+        top_p: f64,
+        repetition_penalty: f32,
+    ) -> Result<Self> {
         println!("Загрузка конфигурации модели...");
         let config_file = File::open(&files.config)?;
         let config: Config = serde_json::from_reader(&config_file)?;
+
+        // Inspect hardware compute matrix capabilities if a non-quantized BF16 profile is requested
+        let mut target_dtype = dtype;
+        if device.is_cuda() && target_dtype == candle_core::DType::BF16 {
+            // Execute a lightweight mathematical probe to explicitly verify native bfloat16 hardware/driver support
+            let probe_tensor = candle_core::Tensor::zeros(&[1], candle_core::DType::BF16, device);
+            let probe_execution = probe_tensor.and_then(|t| t.sqr());
+
+            if probe_execution.is_err() {
+                println!("[HARDWARE FALLBACK] Detected GPU architecture lacks native BF16 execution units (e.g., Turing). Safely promoting operational context to F32.");
+                target_dtype = candle_core::DType::F32;
+            } else {
+                println!("[HARDWARE CHECK] Target GPU successfully validated native hardware BF16 support.");
+            }
+        }
 
         let safetensors = unsafe { 
             candle_core::safetensors::MmapedSafetensors::new(&files.weights)? 
         };
 
-        println!("Using Data Type {:?}", dtype);
+        println!("Using Data Type {:?}", target_dtype);
         let vb = candle_nn::VarBuilder::from_backend(
             Box::new(safetensors),
-            dtype,
+            target_dtype,
             device.clone()
         );
 
@@ -48,9 +75,12 @@ impl InferenceEngine {
         Ok(Self {
             model: EngineModel::Standard(model),
             device: device.clone(),
-            dtype,
+            dtype: target_dtype,
             eos_token: 151645,
             template_kind: "chatml".to_string(),
+            temperature,
+            top_p,
+            repetition_penalty,
         })
     }
 
@@ -60,6 +90,9 @@ impl InferenceEngine {
         architecture: &str,
         eos_token: u32,
         template_kind: &str,
+        temperature: f64,
+        top_p: f64,
+        repetition_penalty: f32,
     ) -> Result<Self> {
         println!("Opening GGUF model file for '{}' architecture...", architecture);
         let mut file = File::open(gguf_path)?;
@@ -118,6 +151,9 @@ impl InferenceEngine {
             dtype: candle_core::DType::F32,
             eos_token,
             template_kind: template_kind.to_string(),
+            temperature,
+            top_p,
+            repetition_penalty,
         })
     }
 
@@ -144,8 +180,11 @@ impl InferenceEngine {
         let mut current_pos = 0;
         let model_dtype = self.dtype;
 
-        // Process prompt: both F32 and BF16 can securely execute batch forward operations
-        let input_tensor = candle_core::Tensor::new(new_tokens.as_slice(), &self.device)?.unsqueeze(0)?;
+        // Process prompt: leverage explicit I64 integer mapping to bypass Turing cast_u32_bf16 driver faults
+        let input_tensor = candle_core::Tensor::new(new_tokens.as_slice(), &candle_core::Device::Cpu)?
+            .unsqueeze(0)?
+            .to_dtype(candle_core::DType::I64)?
+            .to_device(&self.device)?;
         let logits = match &mut self.model {
             EngineModel::Standard(m) => {
                 m.forward(&input_tensor, current_pos)?
@@ -182,7 +221,11 @@ impl InferenceEngine {
             .unwrap_or_default()
             .as_secs();
 
-        let mut logits_processor = LogitsProcessor::new(current_seed, None, None);
+        let mut logits_processor = LogitsProcessor::new(
+            current_seed, 
+            Some(self.temperature), 
+            Some(self.top_p)
+        );
         let mut tokens_queue = Vec::new();
         let mut prev_text = String::new();
 
@@ -200,15 +243,21 @@ impl InferenceEngine {
             let gen_pos = current_pos;
             current_pos += 1;
 
-            if let Ok(text) = tokenizer.decode(&tokens_queue, true) {
-                if text.len() > prev_text.len() {
-                print!("{}", &text[prev_text.len()..]);
-                std::io::Write::flush(&mut std::io::stdout())?;
+            if let Ok(current_text) = tokenizer.decode(&tokens_queue, true) {
+                if current_text.len() > prev_text.len() {
+                    let raw_chunk = &current_text[prev_text.len()..];
+                    
+                    print!("{}", raw_chunk);
+                    std::io::Write::flush(&mut std::io::stdout())?;
                 }
-                prev_text = text;
+                prev_text = current_text;
             }
 
-            let input = candle_core::Tensor::new(&[next_token], &self.device)?.unsqueeze(0)?;
+            // Maintain matching I64 token indexing strategy to safeguard standard sequential forward execution
+            let input = candle_core::Tensor::new(&[next_token], &candle_core::Device::Cpu)?
+                .unsqueeze(0)?
+                .to_dtype(candle_core::DType::I64)?
+                .to_device(&self.device)?;
             let logits = match &mut self.model {
                 EngineModel::Standard(m) => m.forward(&input, gen_pos)?,
                 EngineModel::QuantizedQwen(m) => m.forward(&input, gen_pos)?,
@@ -225,7 +274,7 @@ impl InferenceEngine {
             }.contiguous()?;
             
             // Safe execution branch isolating standard pipeline from low-memory paths
-            let logits = match &self.model {
+            let mut logits = match &self.model {
                 EngineModel::Standard(_) => {
                 if model_dtype == candle_core::DType::BF16 {
                     logits.to_dtype(candle_core::DType::F32)?
@@ -236,16 +285,66 @@ impl InferenceEngine {
                 _ => logits, // All GGUF models are evaluated here and produce native F32 logits
             };
 
+            if self.repetition_penalty > 1.0 {
+                let mut logits_vec = logits.to_vec1::<f32>()?;
+
+                let comma_count = tokens_queue.iter().rev().take(30).filter(|&&t| {
+                    if let Some(text) = tokenizer.id_to_token(t) {
+                        text == ","
+                    } else {
+                        false
+                    }
+                }).count();
+
+                for &prev_token_id in tokens_queue.iter() {
+                    let idx = prev_token_id as usize;
+                    if idx < logits_vec.len() {
+                        if idx != self.eos_token as usize {
+                            let token_str = tokenizer.id_to_token(prev_token_id);
+                            
+                            let is_punctuation = if let Some(ref text) = token_str {
+                                text == "." || text == "," || text == "?" || text == "!"
+                            } else {
+                                false
+                            };
+
+                            if !is_punctuation {
+                                if logits_vec[idx] > 0.0 {
+                                    logits_vec[idx] /= self.repetition_penalty;
+                                } else {
+                                    logits_vec[idx] *= self.repetition_penalty;
+                                }
+                            } else if let Some(ref text) = token_str {
+                                if text == "," && comma_count > 5 {
+                                    if logits_vec[idx] > 0.0 {
+                                        logits_vec[idx] /= self.repetition_penalty * 1.5;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                logits = candle_core::Tensor::new(logits_vec, &self.device)?;
+            }
+
             next_token = logits_processor.sample(&logits)?;
 
             if next_token == self.eos_token {
                 break;
             }
+
+            if let Some(token_text) = tokenizer.id_to_token(next_token) {
+                if token_text == "<|im_end|>" || token_text == "<|end|>" {
+                    break;
+                }
+            }
         }
 
         println!();
 
-        session.add_message("assistant", prev_text.trim());
+        // Sanitize final accumulated text before storing to session state
+        let clean_final_text = prev_text.replace("<br>", "\n");
+        session.add_message("assistant", clean_final_text.trim());
         session.pos_offset = current_pos;
 
         Ok(())

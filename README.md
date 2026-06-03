@@ -4,104 +4,101 @@ A minimalist, experimental playground designed to explore running local Large La
 
 ## Core Architecture
 
-The system consists of a few isolated components working together in a clean, synchronous pipeline:
+The system consists of isolated components working together in a clean, synchronous pipeline:
 
-* **`src/loader.rs`**: Handles automated acquisition and caching of model files (Qwen LLM and sentence-transformer embeddings) directly from the Hugging Face Hub.
-* **`src/inference.rs`**: Implements a low-level, token-by-token autoregressive generation engine using a strict greedy search decoding strategy.
-* **`src/storage.rs`**: Manages persistent conversation history (chat sessions) and a memory-backed vector database for local knowledge lookup.
+* **`src/loader.rs`**: Handles automated acquisition and caching of model files (both standard safetensors configurations and quantized GGUF blocks) directly from the Hugging Face Hub.
+* **`src/inference.rs`**: Implements a low-level, token-by-token autoregressive generation engine with robust context tracking, dynamic repetition penalties, and explicit special token sanitization.
+* **`src/presets.rs`**: Manages pre-configured model profiles (Presets), abstracting parameters like temperature, top_p, tokenizers, and hardware requirements.
+* **`src/storage.rs`**: Manages persistent conversation history (chat sessions) and a memory-backed vector database for local knowledge lookup (RAG).
 
-## 🛠 Tech Stack
+## Advanced Hardware Resilience (BF16 to F32 Fallback)
 
-* **Language**: Rust (for memory safety, predictable resource usage, and raw performance);
-* **ML Framework**: Hugging Face Candle (a minimalist, pure-Rust tensor library with native CUDA support);
-* **Models**: 
-  * **LLM**: `Qwen2.5-1.5B-Instruct` (optimized for local, low-latency multi-turn dialogue);
-  * **Embeddings**: `paraphrase-multilingual-MiniLM-L12-v2` (for cross-lingual semantic search);
-* **Target Hardware**: CUDA-enabled GPUs (utilizes `F32` precision to guarantee out-of-the-box compatibility without precision artifacts);
-* **Environment**: Docker + WSL2 (for deterministic isolation of CUDA toolkits and dependencies).
+To accommodate varying hardware setups without manual configuration, the engine incorporates a **Dynamic Hardware Verification** step during initialization:
+* When a non-quantized `BF16` (bfloat16) profile is selected on a CUDA device, the engine executes a lightweight mathematical probe directly on the GPU.
+* If the underlying GPU architecture lacks native hardware execution units for `BF16` (such as the NVIDIA Turing architecture, e.g., RTX 2060), the engine catches the driver error and **safely promotes the computation context to `F32`**.
+* This guarantees plug-and-play execution across both legacy and modern GPU architectures while preventing hard CUDA runtime driver crashes (`CUDA_ERROR_NOT_FOUND`).
 
-## Getting Started
+## Model Presets
 
-### Prerequisites & Environment Setup
+The application features built-in execution profiles optimized for specific VRAM footprints and token granularities:
 
-The system runs inside a Docker container, isolating the CUDA compilation environment from your host system. 
+| Preset Name | Model Target | VRAM Class | Format / Quantization | Template Layout |
+| :--- | :--- | :--- | :--- | :--- |
+| `qwen-1.5b-bf16` | Qwen2.5-1.5B-Instruct | 6 GB | Safetensors (BF16) | `chatml` |
+| `qwen-3b-q4` | Qwen2.5-3B-Instruct-GGUF | 6 GB | Q4_K_M (Quantized) | `chatml` |
+| `phi3-3.8b-q4` | Phi-3-mini-4k-instruct-GGUF | 6 GB | Q4_K_M (Quantized) | `phi3` |
+| `qwen-7b-q4` | Qwen2.5-7B-Instruct-GGUF | 12 GB | Q4_K_M (Quantized) | `chatml` |
+| `qwen-14b-q4` | Qwen2.5-14B-Instruct-GGUF | 12 GB | Q4_K_M (Quantized) | `chatml` |
 
-*(Note: If you prefer using Windows-side Docker Desktop with WSL integration, simply enable it in Docker Desktop settings. The guide below covers the native, pure Docker installation inside the WSL distribution).*
+> **Note:** The `llama-3.1-8b-q4` profile is currently archived in the source configuration due to Hugging Face repository gated access restrictions but remains available in the source file for manual reactivation.
 
-#### 1. Install Docker Engine inside WSL (Ubuntu)
-Execute the following commands sequentially to set up the official Docker repository and install the engine:
 
+## 💻 CLI Usage & Commands
+
+You can control the runtime behavior directly through command-line arguments:
+
+### 1. List Available Presets
+To see the full matrix of available model configurations and their specific metadata, run:
 ```bash
-# Update package indices and install system dependencies
-sudo apt-get update;
-sudo apt-get install -y ca-certificates curl gnupg;
-
-# Add Docker’s official GPG key
-sudo install -m 0755 -d /etc/apt/keyrings;
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg;
-sudo chmod a+r /etc/apt/keyrings/docker.gpg;
-
-# Set up the repository structure
-echo \
-  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
-  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
-  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null;
-
-# Install Docker components
-sudo apt-get update;
-sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin;
+cargo run -- --list-presets
 ```
 
-#### 2. Configure Non-Root Permissions
+### 2. Execute Inference with a Specific Profile
 
-To allow the execution script and rust-analyzer to communicate with the Docker daemon without constant sudo authentication, add your user to the docker group:
-
-```bash
-sudo usermod -aG docker $USER;
-newgrp docker;
-```
-
-#### 3. Install NVIDIA Container Toolkit (GPU Passthrough)
-
-To map your host's NVIDIA graphics card (Turing, Ampere, etc.) into the container, the Docker daemon requires the native NVIDIA runtime toolkit:
+Pass your desired preset name using the --preset flag, accompanied by the prompt via -p:
 
 ```bash
-# Configure the production repository keys
-curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg;
-curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
-  sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
-  sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list;
+# Run the lightweight Qwen model with automatic hardware validation
+cargo run --release -- --preset qwen-1.5b-bf16 -p "Tell me about Overwatch 2"
 
-# Install the toolkit packages
-sudo apt-get update;
-sudo apt-get install -y nvidia-container-toolkit;
-
-# Register the NVIDIA runtime within Docker configuration and restart the daemon
-sudo nvidia-ctk runtime configure --runtime=docker;
-sudo systemctl restart docker;
+# Run the heavy 14B model targeted for a 12GB VRAM environment
+cargo run --release -- --preset qwen-14b-q4 -p "Explain quantum computing in simple terms"
 ```
 
-#### 4. Verify GPU Availability in Container
-Ensure that the setup was successful and Docker can transparently access the hardware:
-```bash
-docker run --rm --gpus all nvidia/cuda:12.0.0-base-ubuntu22.04 nvidia-smi
-```
-If the command outputs the standard NVIDIA driver statistics table, the environment configuration is complete.
+### 3. Isolated Docker Environment
 
-
-### Running Inference
-
-To initialize the engine, index the local knowledge base, and pass a custom prompt directly to the underlying Qwen model, use the automated execution script:
+For reproducible environment setups, you can leverage the containerized execution matrix:
 
 ```bash
-# Grant execution permissions to the runner script
-chmod +x run-container.sh
-
-# Run inference with a specific question
-./run-container.sh -p "What color is planet Earth?"
+./run-container.sh --preset qwen-3b-q4 -p "Your custom query here"
 ```
 
-### Knowledge Base Customization
+
+## Environment Setup (Docker & NVIDIA Container Toolkit)
+Prerequisites
+
+Ensure your host machine has the NVIDIA Driver and Docker Engine installed.
+
+### 1. Install NVIDIA Container Toolkit
+
+Setup the package repository and install the runtime toolkit:
+
+```bash
+curl -fsSL [https://nvidia.github.io/libnvidia-container/gpgkey](https://nvidia.github.io/libnvidia-container/gpgkey) | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg \
+  && curl -s -l [https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list](https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list) | \
+    sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+    sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+
+sudo apt-get update
+sudo apt-get install -y nvidia-container-toolkit
+```
+
+### 2. Configure Docker Runtime
+
+Register the NVIDIA runtime within Docker configuration and restart the daemon:
+
+```bash
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+```
+
+### 3. Verify GPU Availability in Container
+
+```bash
+docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
+```
+
+## Knowledge Base Customization
 
 You can dynamically expand the model's memory by modifying the `storage/knowledge.txt` file. Organize your custom facts using explicit block headers to guide the vector search engine:
 
@@ -111,3 +108,9 @@ Your highly detailed text or custom data goes here...
 ```
 
 The automation script mounts your local .cargo registry and huggingface cache inside the container, ensuring that subsequent runs reuse the build cache and start instantly.
+
+## Tech Stack
+
+* **Language**: Rust (for memory safety, predictable resource usage, and raw performance);
+* **ML Framework**: Hugging Face Candle (a minimalist, pure-Rust tensor library with native CUDA support);
+* **Data Serialization**: Serde & Serde-JSON (for robust chat transaction and history persistence).
