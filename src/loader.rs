@@ -1,155 +1,29 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
+use hf_hub::api::sync::ApiBuilder;
 use std::path::PathBuf;
+use std::io::Write;
+use crate::presets::PresetInfo;
 
-// Используем легковесную, точную и отлично знающую русский язык модель
-const REPO_ID: &str = "Qwen/Qwen2.5-1.5B-Instruct";
-const TOKENIZER_FILE: &str = "tokenizer.json";
-const CONFIG_FILE: &str = "config.json";
-
-// Структура, хранящая безопасные пути к файлам модели в ОС
 pub struct ModelFiles {
-    pub tokenizer: PathBuf,
-    pub config: PathBuf,
-    pub weights: PathBuf,
+    pub model_path: PathBuf,
 }
 
 impl ModelFiles {
-    // Метод для скачивания или мгновенного извлечения файлов из локального кэша
-    pub fn download() -> Result<Self> {
-        println!("Проверка локального кэша для модели: {}", REPO_ID);
+    pub fn download_model_files(preset: &PresetInfo) -> Result<Self> {
+        println!("Checking local cache for GGUF model: {}/{}", preset.repo_id, preset.filename);
+        std::io::stdout().flush()?;
 
-        let cache = hf_hub::Cache::default();
-        let repo_cache = cache.repo(hf_hub::Repo::new(REPO_ID.to_string(), hf_hub::RepoType::Model));
+        let api = ApiBuilder::new()
+            .with_progress(true)
+            .build()
+            .context("Failed to initialize Hugging Face API Client")?;
 
-        let tokenizer_path = repo_cache.get(TOKENIZER_FILE);
-        let config_path = repo_cache.get(CONFIG_FILE);
-        let weights_path = repo_cache.get("model.safetensors");
+        let repo = api.model(preset.repo_id.to_string());
+        let model_path = repo.get(preset.filename)
+            .context("Failed to download or locate GGUF model weight file")?;
 
-        if let (Some(tokenizer), Some(config), Some(weights)) = (tokenizer_path, config_path, weights_path) {
-        println!("Все необходимые файлы модели верифицированы и готовы к работе.");
-        return Ok(Self {
-            tokenizer,
-            config,
-            weights,
-        });
-        };
+        println!("GGUF file verified and ready to use.");
 
-        println!("Файлы модели не найдены локально. Подключение к Hugging Face для скачивания...");
-        let mut builder = hf_hub::api::sync::ApiBuilder::new();
-        if let Ok(token) = std::env::var("HF_TOKEN") {
-            builder = builder.with_token(Some(token));
-        }
-        let api = builder.with_progress(true).build()?;
-
-        let repo = api.model(REPO_ID.to_string());
-
-        let tokenizer = repo.get(TOKENIZER_FILE)?;
-        let config = repo.get(CONFIG_FILE)?;
-        let weights = repo.get("model.safetensors")?;
-
-        println!("Все необходимые файлы модели успешно загружены.");
-        return Ok(Self {
-            tokenizer,
-            config,
-            weights,
-        });
-    }
-
-    pub fn download_tokenizer_only(repo_id: &str) -> Result<std::path::PathBuf> {
-        let cache = hf_hub::Cache::default();
-        let repo_cache = cache.repo(hf_hub::Repo::new(repo_id.to_string(), hf_hub::RepoType::Model));
-
-        if let Some(tok_path) = repo_cache.get("tokenizer.json") {
-            return Ok(tok_path);
-        };
-
-        let mut builder = hf_hub::api::sync::ApiBuilder::new();
-        if let Ok(token) = std::env::var("HF_TOKEN") {
-            builder = builder.with_token(Some(token));
-        }
-        let api = builder.with_progress(true).build()?;
-
-        let repo = api.model(repo_id.to_string());
-        let tok_path = repo.get("tokenizer.json")?;
-        Ok(tok_path)
-    }
-
-    pub fn download_gguf(repo_id: &str, gguf_file: &str) -> Result<std::path::PathBuf> {
-        println!("Проверка локального кэша для GGUF модели: {}/{}", repo_id, gguf_file);
-        let cache = hf_hub::Cache::default();
-        let repo_cache = cache.repo(hf_hub::Repo::new(repo_id.to_string(), hf_hub::RepoType::Model));
-    
-        if let Some(local_path) = repo_cache.get(gguf_file) {
-            println!("GGUF файл верифицирован и готов к работе.");
-            return Ok(local_path);
-        };
-    
-        println!("GGUF файл не найден локально. Подключение к Hugging Face для загрузки...");
-        let mut builder = hf_hub::api::sync::ApiBuilder::new();
-        if let Ok(token) = std::env::var("HF_TOKEN") {
-            builder = builder.with_token(Some(token));
-        }
-        let api = builder.with_progress(true).build()?;
-
-        let repo = api.model(repo_id.to_string());
-        let downloaded_path = repo.get(gguf_file)?;
-        
-        println!("GGUF файл успешно загружен.");
-        Ok(downloaded_path)
-    }
-}
-
-// Структура для путей к файлам модели эмбеддингов
-pub struct EmbeddingFiles {
-    pub config: PathBuf,
-    pub weights: PathBuf,
-    pub tokenizer: PathBuf,
-}
-
-impl EmbeddingFiles {
-    // Автоматическая загрузка или верификация локального кэша для BGE-модели
-    pub fn download_or_get() -> anyhow::Result<Self> {
-        let repo_id = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2";
-        println!("Проверка локального кэша для мультиязычной модели эмбеддингов: {}", repo_id);
-
-        let cache = hf_hub::Cache::default();
-        let repo_cache = cache.repo(hf_hub::Repo::new(repo_id.to_string(), hf_hub::RepoType::Model));
-
-        let config_path = repo_cache.get("config.json");
-        let weights_path = repo_cache.get("model.safetensors");
-        let tokenizer_path = repo_cache.get("tokenizer.json");
-
-        if let (Some(config), Some(weights), Some(tokenizer)) = (config_path, weights_path, tokenizer_path) {
-        println!("Все необходимые файлы эмбеддингов верифицированы из локального кэша.");
-        return Ok(Self {
-            config,
-            weights,
-            tokenizer,
-        });
-        };
-
-        println!("Файлы эмбеддингов не найдены локально. Подключение к Hugging Face для скачивания...");
-        
-        let mut builder = hf_hub::api::sync::ApiBuilder::new();
-        if let Ok(token) = std::env::var("HF_TOKEN") {
-            builder = builder.with_token(Some(token));
-        }
-        let api = builder.with_progress(true).build()?;
-
-        let repo = api.model(repo_id.to_string());
-
-        let config = repo.get("config.json")
-            .map_err(|e| anyhow::anyhow!("Не удалось загрузить config.json для эмбеддингов: {}", e))?;
-        let weights = repo.get("model.safetensors")
-            .map_err(|e| anyhow::anyhow!("Не удалось загрузить model.safetensors для эмбеддингов: {}", e))?;
-        let tokenizer = repo.get("tokenizer.json")
-            .map_err(|e| anyhow::anyhow!("Не удалось загрузить tokenizer.json для эмбеддингов: {}", e))?;
-
-        println!("Все необходимые файлы эмбеддингов успешно загружены.");
-        return Ok(Self {
-            config,
-            weights,
-            tokenizer,
-        });
+        Ok(ModelFiles { model_path })
     }
 }

@@ -1,31 +1,272 @@
-use candle_core::{Tensor, Device, DType};
-use candle_nn::{VarBuilder};
-use candle_transformers::models::bert::{BertModel, Config};
 use serde::{Serialize, Deserialize};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 use anyhow::Result;
+use candle_transformers::models::bert::{BertModel};
+
+// Import necessary items from Candle ecosystem for vector operations
+use candle_core::{Tensor, Device, DType};
+use candle_nn::VarBuilder;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ChatMessage {
-  pub role: String,
-  pub content: String,
+    pub role: String,
+    pub content: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ChatSession {
-  pub messages: Vec<ChatMessage>,
-  pub pos_offset: usize,
+    pub messages: Vec<ChatMessage>,
+    pub pos_offset: usize,
+}
+
+// Structure to store single indexed knowledge units
+pub struct KnowledgeDocument {
+    pub text: String,
+    pub embedding: Tensor,
+}
+
+// Unified core vector registry subsystem
+pub struct VectorRegistry {
+    pub documents: Vec<KnowledgeDocument>,
+    pub bert: BertModel,
+    pub tokenizer: tokenizers::Tokenizer,
+    pub device: Device,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CachedDocument {
+    text: String,
+    embedding_data: Vec<f32>,
+}
+
+impl VectorRegistry {
+    pub fn bootstrap(
+        knowledge_path: &Path,
+        model_path: &Path,
+        config_path: &Path,
+        tokenizer_path: &Path,
+        device: &Device,
+    ) -> Result<Self> {
+        let config_file = File::open(config_path)?;
+        // Simple placeholder decoding logic matching target configuration layout
+        let config = serde_json::from_reader(config_file)?;
+        
+        let safetensors = unsafe { candle_core::safetensors::MmapedSafetensors::new(model_path)? };
+        let vb = VarBuilder::from_backend(Box::new(safetensors), DType::F32, device.clone());
+        let bert = BertModel::load(vb, &config)?;
+        
+        let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path)
+            .map_err(|e| anyhow::anyhow!("Failed to initialize target embeddings tokenizer structure: {}", e))?;
+
+        let cache_path = Path::new("storage/embeddings.json");
+        let mut documents = Vec::new();
+
+        if cache_path.exists() {
+            println!("Loading pre-computed vector representations from local cache...");
+            let cache_file = File::open(cache_path)?;
+            let cached_docs: Vec<CachedDocument> = serde_json::from_reader(cache_file)?;
+            
+            for doc in cached_docs {
+                let tensor = Tensor::new(doc.embedding_data.as_slice(), device)?;
+                documents.push(KnowledgeDocument {
+                    text: doc.text,
+                    embedding: tensor,
+                });
+            }
+        } else if knowledge_path.exists() {
+            println!("Indexing targets located. Constructing vector representations...");
+
+            // Read the entire file content into a unified string buffer
+            let content = std::fs::read_to_string(knowledge_path)?;
+
+            let paragraphs: Vec<String> = content
+                .split("\n\n")
+                .map(|p| {
+                    // Replace all single internal newlines with ordinary spaces, then trim
+                    p.replace(['\n', '\r'], " ").trim().to_string()
+                })
+                .filter(|p| !p.is_empty() && p.len() > 10)
+                .collect();
+
+            let chunk_size = 200; 
+            let overlap = 40;
+
+            // Slide the window across the words array
+            for paragraph in paragraphs {
+                let words: Vec<&str> = paragraph.split_whitespace().collect();
+
+                // Step 2: If the paragraph fits into a single chunk, index it directly
+                if words.len() <= chunk_size {
+                    let chunk_text = words.join(" ");
+                    
+                    let tokens = tokenizer.encode(chunk_text.as_str(), true)
+                        .map_err(|e| anyhow::anyhow!("Tokenizer sequence mapping failure: {}", e))?;
+                    
+                    let token_ids = tokens.get_ids();
+                    let input_ids = Tensor::new(token_ids, device)?.unsqueeze(0)?;
+                    let token_type_ids = Tensor::zeros_like(&input_ids)?;
+
+                    let embeddings = bert.forward(&input_ids, &token_type_ids, None)?;
+                    let doc_embedding = embeddings.mean_keepdim(1)?.squeeze(1)?.squeeze(0)?;
+                    let normalized_doc_embedding = Self::l2_normalize(&doc_embedding)?;
+
+                    documents.push(KnowledgeDocument {
+                        text: chunk_text,
+                        embedding: normalized_doc_embedding,
+                    });
+                } else {
+                    // Step 3: If the paragraph is huge, process it via sliding window
+                    let mut start_idx = 0;
+                    while start_idx < words.len() {
+                        let end_idx = std::cmp::min(start_idx + chunk_size, words.len());
+                        let chunk_text = words[start_idx..end_idx].join(" ");
+                        
+                        let tokens = tokenizer.encode(chunk_text.as_str(), true)
+                            .map_err(|e| anyhow::anyhow!("Tokenizer sequence mapping failure: {}", e))?;
+                        
+                        let token_ids = tokens.get_ids();
+                        let input_ids = Tensor::new(token_ids, device)?.unsqueeze(0)?;
+                        let token_type_ids = Tensor::zeros_like(&input_ids)?;
+
+                        let embeddings = bert.forward(&input_ids, &token_type_ids, None)?;
+                        let doc_embedding = embeddings.mean_keepdim(1)?.squeeze(1)?.squeeze(0)?;
+                        let normalized_doc_embedding = Self::l2_normalize(&doc_embedding)?;
+
+                        documents.push(KnowledgeDocument {
+                            text: chunk_text,
+                            embedding: normalized_doc_embedding,
+                        });
+
+                        start_idx += chunk_size - overlap;
+
+                        if end_idx >= words.len() {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let cache_to_save: Vec<CachedDocument> = documents
+                .iter()
+                .map(|d| {
+                    let data = d.embedding.to_vec1::<f32>().unwrap_or_default();
+                    CachedDocument { text: d.text.clone(), embedding_data: data }
+                })
+                .collect();
+            
+            if let Some(parent) = cache_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            let mut file = File::create(cache_path)?;
+            let json_bytes = serde_json::to_vec_pretty(&cache_to_save)?;
+            file.write_all(&json_bytes)?;
+            println!("Vector cache successfully flushed to disk.");
+        } else {
+            println!("Warning: Database resource path missing. Standby for empty execution context.");
+        }
+
+        Ok(Self { 
+            documents, 
+            bert, 
+            tokenizer, 
+            device: device.clone(),
+        })
+    }
+
+    pub fn find_relevant_context(&mut self, query: &str) -> Result<Option<String>> {
+        println!("\n=== [STORAGE] SEARCHING RELEVANT CONTEXT IN KNOWLEDGE BASE ===");
+        println!("Query payload: '{}'", query);
+
+        if self.documents.is_empty() {
+            println!("Knowledge base is empty. Skipping vector search.");
+            return Ok(None);
+        }
+
+        // Tokenize incoming query for the BERT model
+        let tokens = self.tokenizer.encode(query, true)
+            .map_err(|e| anyhow::anyhow!("Tokenizer error: {}", e))?;
+        let token_ids = tokens.get_ids();
+
+        println!("[DEBUG] VectorRegistry self.device is: {:?}", self.device);
+
+        let input_ids = Tensor::new(token_ids, &self.device)?.unsqueeze(0)?;
+        let token_type_ids = Tensor::zeros_like(&input_ids)?;
+
+        println!("[DEBUG] input_ids device: {:?}, shape: {:?}", input_ids.device(), input_ids.shape());
+        println!("[DEBUG] token_type_ids device: {:?}, shape: {:?}", token_type_ids.device(), token_type_ids.shape());
+
+        // Extract query embedding layer from BERT forward pass
+        let embeddings = self.bert.forward(&input_ids, &token_type_ids, None)?;
+        let query_embedding = embeddings.mean_keepdim(1)?.squeeze(1)?.squeeze(0)?;
+
+        println!("[DEBUG] query_embedding device: {:?}, shape: {:?}", query_embedding.device(), query_embedding.shape());
+
+        // Pre-normalize query vector to unit length outside the core loop
+        let normalized_query = Self::l2_normalize(&query_embedding)?;
+
+        println!("[DEBUG] normalized_query device: {:?}, shape: {:?}", normalized_query.device(), normalized_query.shape());
+
+        let mut best_score = -1.0f32;
+        let mut best_text = Option::<String>::None;
+
+        if let Some(first_doc) = self.documents.first() {
+            println!("[DEBUG] Sample document embedding device: {:?}, shape: {:?}", first_doc.embedding.device(), first_doc.embedding.shape());
+        }
+
+        println!("[DEBUG] Starting inner distance calculation loop across {} documents...", self.documents.len());
+
+        // Iterate through stored documents to find the highest cosine similarity
+        for doc in &self.documents {
+            // Since both vectors are L2-normalized, their dot product 
+            // is mathematically equal to the exact Cosine Similarity metric.
+            let score = (&doc.embedding * &normalized_query)?
+                .sum_all()?
+                .to_scalar::<f32>()?;
+
+            if score > best_score {
+                best_score = score;
+                best_text = Some(doc.text.clone());
+            }
+        }
+
+        println!("Closest knowledge chunk located with similarity score: {:.4}", best_score);
+        
+        // Match against a safety threshold to prevent injecting irrelevant data
+        if best_score > 0.30 {
+            if best_text.is_some() {
+                println!("Context successfully extracted and verified for LLM context injection.");
+            }
+            Ok(best_text)
+        } else {
+            println!("Similarity score below threshold. No relevant context injected.");
+            Ok(None)
+        }
+    }
+
+    fn l2_normalize(tensor: &Tensor) -> Result<Tensor> {
+        // Calculate the square root of the sum of all squared elements
+        let squared_sum = tensor.sqr()?.sum_all()?;
+        let norm = squared_sum.sqrt()?;
+        
+        // Use a tiny epsilon to prevent division by zero on empty or zero vectors
+        let epsilon = Tensor::new(1e-12f32, tensor.device())?;
+        let safe_norm = norm.maximum(&epsilon)?;
+        
+        let normalized = tensor.broadcast_div(&safe_norm)?;
+        Ok(normalized)
+    }
 }
 
 impl ChatSession {
-    // Загрузка сессии с диска. Если файла нет — создаем пустую сессию
+    // Load session from disk. If file missing, initialize an empty session state.
     pub fn load_or_create<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path_ref = path.as_ref();
         
         if !path_ref.exists() {
-            // Если папки storage/ нет, создаем ее
+            // Create parent storage directory directory if it does not exist
             if let Some(parent) = path_ref.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -43,7 +284,7 @@ impl ChatSession {
         Ok(session)
     }
 
-    // Сохранение текущего состояния сессии на диск
+    // Persist current chat history session structure to disk
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let json_bytes = serde_json::to_vec_pretty(self)?;
         let mut file = File::create(path)?;
@@ -51,153 +292,16 @@ impl ChatSession {
         Ok(())
     }
 
-    // Добавление новой реплики в историю
+    // Push new message into session lifecycle tracking array
     pub fn add_message(&mut self, role: &str, content: &str) {
         self.messages.push(ChatMessage {
             role: role.to_string(),
             content: content.to_string(),
         });
-        // Держим историю компактной, удаляя старые сообщения, если превышен лимит
+        
+        // Keep context window compact by dropping oldest tokens
         if self.messages.len() > 20 {
             self.messages.drain(0..self.messages.len() - 20);
         };
-    }
-}
-
-// Структура для хранения проиндексированного блока знаний
-pub struct KnowledgeDocument {
-    pub text: String,
-    pub embedding: Tensor,
-}
-
-pub struct VectorRegistry {
-    pub documents: Vec<KnowledgeDocument>,
-    pub bert: BertModel,
-    pub tokenizer: tokenizers::Tokenizer,
-    pub device: Device,
-}
-
-impl VectorRegistry {
-    // Индексируем текстовый файл, превращая каждый блок в вектор
-    pub fn bootstrap(
-        knowledge_path: &Path,
-        model_path: &Path,
-        config_path: &Path,
-        tokenizer_path: &Path,
-        device: &Device,
-    ) -> anyhow::Result<Self> {
-        let config_file = File::open(config_path)?;
-        let config: Config = serde_json::from_reader(&config_file)?;
-        
-        let safetensors = unsafe { candle_core::safetensors::MmapedSafetensors::new(model_path)? };
-        let vb = VarBuilder::from_backend(Box::new(safetensors), DType::F32, device.clone());
-        let bert = BertModel::load(vb, &config)?;
-        
-        let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path)
-            .map_err(|e| anyhow::anyhow!("Ошибка загрузки токенизатора эмбеддингов: {}", e))?;
-
-        let mut documents = Vec::new();
-
-        if knowledge_path.exists() {
-            let file = File::open(knowledge_path)?;
-            let reader = std::io::BufReader::new(file);
-            use std::io::BufRead;
-
-            let mut current_section = String::new();
-
-            for line in reader.lines() {
-                let line = line?.trim().to_string();
-                if line.is_empty() {
-                    continue;
-                }
-
-                // Если строка — это заголовок секции, запоминаем её и НЕ индексируем отдельно
-                if line.starts_with("===") && line.ends_with("===") {
-                    current_section = line.replace("===", "").trim().to_string();
-                    continue;
-                }
-
-                // К каждому контентному абзацу подмешиваем имя его секции для идеального векторного поиска
-                let full_chunk_text = if !current_section.is_empty() {
-                    format!("[Section: {}] {}", current_section, line)
-                } else {
-                    line
-                };
-
-                // Генерируем эмбеддинг для склеенного чанка
-                let tokens = tokenizer.encode(full_chunk_text.as_str(), true)
-                    .map_err(|e| anyhow::anyhow!("Tokenizer error: {}", e))?;
-                let token_ids = tokens.get_ids();
-                let input_ids = Tensor::new(token_ids, &device)?.unsqueeze(0)?;
-                let token_type_ids = Tensor::zeros_like(&input_ids)?;
-
-                let embeddings = bert.forward(&input_ids, &token_type_ids, None)?;
-                let embedding = embeddings.mean_keepdim(1)?.squeeze(1)?.squeeze(0)?;
-
-                // Сохраняем в документ именно полный текст с фактами
-                documents.push(KnowledgeDocument {
-                    text: full_chunk_text,
-                    embedding,
-                });
-            }
-        }
-
-        Ok(Self { 
-            documents, 
-            bert, 
-            tokenizer, 
-            device: device.clone() 
-        })
-    }
-
-
-    // Высокоуровневый семантический поиск: принимает строку текста и возвращает контекст
-    pub fn find_relevant_context(&mut self, query: &str) -> Result<Option<String>> {
-        // 1. Получаем эмбеддинг для запроса пользователя
-        let tokens = self.tokenizer.encode(query, true)
-            .map_err(|e| anyhow::anyhow!("Query tokenizer error: {}", e))?;
-        let token_ids = tokens.get_ids();
-        
-        let input_ids = Tensor::new(token_ids, &self.device)?.unsqueeze(0)?;
-        let token_type_ids = Tensor::zeros_like(&input_ids)?;
-        let embeddings = self.bert.forward(&input_ids, &token_type_ids, None)?;
-        let query_vector = embeddings.mean_keepdim(1)?.squeeze(1)?.squeeze(0)?;
-
-        // 2. Считаем косинусное сходство со всеми документами
-        let mut best_text = None;
-        let mut max_similarity = -1.0;
-
-        println!("\n=== [DEBUG] СТАРТ ПОИСКА ПО БАЗЕ ЗНАНИЙ ===");
-        println!("Запрос: '{}'", query);
-
-        for (idx, doc) in self.documents.iter().enumerate() {
-            let dot_product = (&doc.embedding * &query_vector)?.sum_all()?.to_scalar::<f32>()?;
-            let norm_a = doc.embedding.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
-            let norm_b = query_vector.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
-            
-            let denominator = norm_a * norm_b;
-            let similarity = if denominator > 1e-6 {
-                dot_product / denominator
-            } else {
-                0.0
-            };
-
-            // Выводим имя блока (первые 35 символов) и его честный скор
-            let short_title: String = doc.text.chars().take(35).collect();
-            println!("  -> Блок №{} [{}...]: similarity = {:.4}", idx, short_title.replace('\n', " "), similarity);
-
-            if similarity > max_similarity {
-                max_similarity = similarity;
-                best_text = Some(doc.text.clone());
-            }
-        }
-
-        println!("-> Vector search completed. Max similarity score: {:.4}", max_similarity);
-
-        if max_similarity > 0.45 {
-            Ok(best_text)
-        } else {
-            Ok(None)
-        }
     }
 }

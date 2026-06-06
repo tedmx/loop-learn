@@ -2,3 +2,7 @@
 *.diff
 *.zip
 chat_history.json
+session.json
+embeddings.json
+tokenizer.json
+model.safetensors

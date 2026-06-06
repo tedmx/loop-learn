@@ -6,34 +6,38 @@ A minimalist, experimental playground designed to explore running local Large La
 
 The system consists of isolated components working together in a clean, synchronous pipeline:
 
-* **`src/loader.rs`**: Handles automated acquisition and caching of model files (both standard safetensors configurations and quantized GGUF blocks) directly from the Hugging Face Hub.
-* **`src/inference.rs`**: Implements a low-level, token-by-token autoregressive generation engine with robust context tracking, dynamic repetition penalties, and explicit special token sanitization.
-* **`src/presets.rs`**: Manages pre-configured model profiles (Presets), abstracting parameters like temperature, top_p, tokenizers, and hardware requirements.
-* **`src/storage.rs`**: Manages persistent conversation history (chat sessions) and a memory-backed vector database for local knowledge lookup (RAG).
+* **`src/loader.rs`**: Handles automated acquisition, verification, and local path-mapping of quantized GGUF blocks.
+* **`src/inference.rs`**: Implements a native, token-by-token autoregressive generation engine backed by **`llama-cpp-2` bindings** for high-performance GGUF execution.
+* **`src/presets.rs`**: Manages pre-configured model profiles (Presets), abstracting parameters like temperature, top_p, and hardware-specific VRAM allocation targets.
+* **`src/storage.rs`**: Manages persistent conversation history (chat sessions) and the `VectorRegistry` — a memory-backed vector database for local knowledge lookup (RAG) featuring local JSON caching.
 
-## Advanced Hardware Resilience (BF16 to F32 Fallback)
+---
 
-To accommodate varying hardware setups without manual configuration, the engine incorporates a **Dynamic Hardware Verification** step during initialization:
-* When a non-quantized `BF16` (bfloat16) profile is selected on a CUDA device, the engine executes a lightweight mathematical probe directly on the GPU.
-* If the underlying GPU architecture lacks native hardware execution units for `BF16` (such as the NVIDIA Turing architecture, e.g., RTX 2060), the engine catches the driver error and **safely promotes the computation context to `F32`**.
-* This guarantees plug-and-play execution across both legacy and modern GPU architectures while preventing hard CUDA runtime driver crashes (`CUDA_ERROR_NOT_FOUND`).
+## Storage & Required Assets
+
+Before running the application, you need to populate the `storage/` directory. Due to their large size, model files and embedding layers must be downloaded manually from the Hugging Face Hub (or your registry of choice):
+
+1. **GGUF Models:** Download your target models (e.g., Qwen, Phi-3, or Llama) in `.gguf` format and place them under `storage/models/`.
+2. **Embedding Weights:** If you are using a local vector-transformer configuration for RAG, ensure the corresponding configuration and weight files are placed inside `storage/embeddings/`.
+
+On the first run, the engine indexes `storage/knowledge.txt` and caches the computed vectors into `storage/embeddings.json`. Subsequent boots skip the indexing phase entirely if the source file remains unchanged.
+
+---
 
 ## Model Presets
 
-The application features built-in execution profiles optimized for specific VRAM footprints and token granularities:
+The application features built-in execution profiles optimized for specific VRAM footprints:
 
 | Preset Name | Model Target | VRAM Class | Format / Quantization | Template Layout |
 | :--- | :--- | :--- | :--- | :--- |
-| `qwen-1.5b-bf16` | Qwen2.5-1.5B-Instruct | 6 GB | Safetensors (BF16) | `chatml` |
 | `qwen-3b-q4` | Qwen2.5-3B-Instruct-GGUF | 6 GB | Q4_K_M (Quantized) | `chatml` |
 | `phi3-3.8b-q4` | Phi-3-mini-4k-instruct-GGUF | 6 GB | Q4_K_M (Quantized) | `phi3` |
+| `llama-3b-q4` | Llama-3-Instruct-GGUF | 6 GB | Q4_K_M (Quantized) | `llama3` |
 | `qwen-7b-q4` | Qwen2.5-7B-Instruct-GGUF | 12 GB | Q4_K_M (Quantized) | `chatml` |
-| `qwen-14b-q4` | Qwen2.5-14B-Instruct-GGUF | 12 GB | Q4_K_M (Quantized) | `chatml` |
 
-> **Note:** The `llama-3.1-8b-q4` profile is currently archived in the source configuration due to Hugging Face repository gated access restrictions but remains available in the source file for manual reactivation.
+---
 
-
-## 💻 CLI Usage & Commands
+## CLI Usage & Commands
 
 You can control the runtime behavior directly through command-line arguments:
 
@@ -48,11 +52,11 @@ cargo run -- --list-presets
 Pass your desired preset name using the --preset flag, accompanied by the prompt via -p:
 
 ```bash
-# Run the lightweight Qwen model with automatic hardware validation
-cargo run --release -- --preset qwen-1.5b-bf16 -p "Tell me about Overwatch 2"
+# Run a lightweight model targeted for a 6GB VRAM environment
+cargo run --release -- --preset qwen-3b-q4 -p "Tell me about local LLM inference optimizations"
 
-# Run the heavy 14B model targeted for a 12GB VRAM environment
-cargo run --release -- --preset qwen-14b-q4 -p "Explain quantum computing in simple terms"
+# Run a heavy model targeted for a 12GB VRAM environment
+cargo run --release -- --preset qwen-7b-q4 -p "Explain quantum computing in simple terms"
 ```
 
 ### 3. Isolated Docker Environment
@@ -63,11 +67,11 @@ For reproducible environment setups, you can leverage the containerized executio
 ./run-container.sh --preset qwen-3b-q4 -p "Your custom query here"
 ```
 
-
 ## Environment Setup (Docker & NVIDIA Container Toolkit)
-Prerequisites
 
-Ensure your host machine has the NVIDIA Driver and Docker Engine installed.
+### Prerequisites
+
+Ensure your host machine has the NVIDIA Driver (supporting CUDA 12.2+) and Docker Engine installed.
 
 ### 1. Install NVIDIA Container Toolkit
 
@@ -75,7 +79,7 @@ Setup the package repository and install the runtime toolkit:
 
 ```bash
 curl -fsSL [https://nvidia.github.io/libnvidia-container/gpgkey](https://nvidia.github.io/libnvidia-container/gpgkey) | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg \
-  && curl -s -l [https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list](https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list) | \
+  && curl -s -L [https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list](https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list) | \
     sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
     sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
 
@@ -95,9 +99,8 @@ sudo systemctl restart docker
 ### 3. Verify GPU Availability in Container
 
 ```bash
-docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
+docker run --rm --gpus all nvidia/cuda:12.2.2-devel-ubuntu22.04 nvidia-smi
 ```
-
 ## Knowledge Base Customization
 
 You can dynamically expand the model's memory by modifying the `storage/knowledge.txt` file. Organize your custom facts using explicit block headers to guide the vector search engine:
@@ -107,10 +110,10 @@ You can dynamically expand the model's memory by modifying the `storage/knowledg
 Your highly detailed text or custom data goes here...
 ```
 
-The automation script mounts your local .cargo registry and huggingface cache inside the container, ensuring that subsequent runs reuse the build cache and start instantly.
+💡 Performance Note: When you spin up the pipeline, `loop-learn` validates the state of `knowledge.txt`. If it hasn't changed, it instantly loads pre-computed vectors from `storage/embeddings.json` instead of processing the text again.
 
 ## Tech Stack
 
-* **Language**: Rust (for memory safety, predictable resource usage, and raw performance);
-* **ML Framework**: Hugging Face Candle (a minimalist, pure-Rust tensor library with native CUDA support);
-* **Data Serialization**: Serde & Serde-JSON (for robust chat transaction and history persistence).
+* Language: Rust (for memory safety, predictable resource usage, and raw performance);
+* Inference Engine: llama-cpp-2 bindings (safe Rust wrapper around llama.cpp for hardware-accelerated GGUF execution);
+* Data Serialization: Serde & Serde-JSON (for robust chat transaction and vector cache persistence).

@@ -1,28 +1,25 @@
 #!/bin/bash
 
-# Название Docker-образа
-IMAGE_NAME="loop-env"
+# Target Docker image name
+IMAGE_NAME="loop-learn-app"
 
-# Проверяем, существует ли локальный образ. Если нет — запускаем сборку
+# Check if local image exists. If not — trigger build sequence
 if ! docker images --format "{{.Repository}}" | grep -q "^${IMAGE_NAME}$"; then
-    echo "=== Docker-образ ${IMAGE_NAME} не найден. Начинаю сборку... ==="
+    echo "=== Docker image ${IMAGE_NAME} not found. Starting build sequence... ==="
     docker build -t "$IMAGE_NAME" .
     if [ $? -ne 0 ]; then
-        echo "Ошибка: Не удалось собрать Docker-образ."
+        echo "Error: Failed to build target Docker image."
         exit 1
     fi
 fi
 
-echo "=== Запуск проекта loop-learn в изолированном контейнере... ==="
+echo "=== Launching loop-learn engine inside isolated container... ==="
 
+# Guarantee local presence of storage directory for state persistence
 mkdir -p storage;
 
-# Запуск контейнера с пробросом аргументов
-docker run --rm --gpus all -e HF_TOKEN \
-  -v "$(pwd):/usr/src/app" \
+# Run container with hardware routing, active HF_TOKEN, and host-mapped cache paths
+docker run -it --rm --gpus all -e HF_TOKEN \
+  -v "$(pwd)/storage:/usr/src/loop-learn/storage" \
   -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
-  -v "$HOME/.cargo/registry:/root/.cargo/registry" \
-  -v "$HOME/.cargo/git:/root/.cargo/git" \
-  -w /usr/src/app \
-  loop-env \
-  cargo run --release -- "$@"
+  loop-learn-app:latest cargo run --release -- "$@"

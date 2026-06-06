@@ -1,5 +1,9 @@
-use anyhow::Result;
+#[link(name = "nccl")]
+unsafe extern "C" {}
+
+use anyhow::{Context, Result};
 use std::path::Path;
+use std::io::Write;
 
 mod loader; 
 mod inference;
@@ -7,6 +11,8 @@ mod storage;
 mod presets;
 
 use storage::ChatSession;
+use loader::ModelFiles;
+use inference::InferenceEngine;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -28,127 +34,117 @@ fn main() -> Result<()> {
         "qwen-3b-q4"
     };
 
-    let selected_preset = crate::presets::PRESETS
+    let preset = crate::presets::PRESETS
         .iter()
         .find(|p| p.name == preset_name)
         .ok_or_else(|| anyhow::anyhow!("CLI Error: Profile '{}' not found. Execute with --list-presets to view choices.", preset_name))?;
 
-    // Bind execution context to target GPU index (0 for 6GB target, 1 for 12GB runtime)
-    let cuda_index = if selected_preset.vram_limit == "12 GB" { 1 } else { 0 };
-    let device = candle_core::Device::new_cuda(cuda_index)
-        .unwrap_or(candle_core::Device::Cpu);
-
-    let (mut engine, tokenizer_path) = match selected_preset.kind {
-        crate::presets::ModelKind::Gguf => {
-            let repo = selected_preset.repo_id;
-            let filename = selected_preset.filename
-                .ok_or_else(|| anyhow::anyhow!("Internal Error: Target GGUF filename payload is empty"))?;
-            
-            let gguf_path = crate::loader::ModelFiles::download_gguf(repo, filename)?;
-            let tok_path = crate::loader::ModelFiles::download_tokenizer_only(selected_preset.tokenizer_repo)?;
-            
-            // Resolve runtime architecture target from the preset name prefix
-            let architecture = if selected_preset.name.starts_with("phi") {
-                "phi3"
-            } else if selected_preset.name.starts_with("llama") {
-                "llama"
-            } else {
-                "qwen"
-            };
-
-            let eng = crate::inference::InferenceEngine::new_gguf(
-                &gguf_path, 
-                &device, 
-                architecture,
-                selected_preset.eos_token,
-                selected_preset.template_kind,
-                selected_preset.temperature,
-                selected_preset.top_p,
-                selected_preset.repetition_penalty,
-            )?;
-
-            (eng, tok_path)
-        },
-        crate::presets::ModelKind::Standard => {
-            let env_files = crate::loader::ModelFiles::download()?; 
-            let eng = crate::inference::InferenceEngine::new(
-                &env_files,
-                &device,
-                selected_preset.dtype,
-                selected_preset.eos_token,
-                selected_preset.template_kind,
-                selected_preset.temperature,
-                selected_preset.top_p,
-                selected_preset.repetition_penalty,
-            )?;
-            (eng, env_files.tokenizer)
+    // Extract hardware routing directly from runtime configuration argument or preset
+    let cuda_index = if let Some(pos) = args.iter().position(|x| x == "--cuda-index") {
+        if pos + 1 < args.len() {
+            args[pos + 1].parse::<i32>().unwrap_or(0)
+        } else {
+            0
         }
-    };
-
-    // Instantiate tokenizer instance using isolated local path setup
-    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow::anyhow!(e))?;
-
-    let prompt_arg = if let Some(pos) = args.iter().position(|x| x == "-p") {
-        args.get(pos + 1).map(|s| s.as_str())
+    } else if preset.vram_limit == "12 GB" {
+        1
     } else {
-        None
+        0
     };
 
-    if let Some(prompt_str) = prompt_arg {
-        let history_path = Path::new("storage/chat_history.json");
-        let mut session = ChatSession::load_or_create(history_path)?;
+    let model_files = ModelFiles::download_model_files(preset)
+        .context("Failed to prepare GGUF model files")?;
+    
+    println!("Initializing local hardware execution context...");
+    let engine = InferenceEngine::new(&model_files, cuda_index)
+        .context("Failed to build unified inference engine lifecycle")?;
 
-        // --- ИЗОЛИРОВАННЫЙ БЛОК ДЛЯ СЕМАНТИЧЕСКОГО ПОИСКА ---
-        let context_info = {
-            let embed_files = crate::loader::EmbeddingFiles::download_or_get()?;
-            let knowledge_path = std::path::Path::new("storage/knowledge.txt");
+    let storage_dir = Path::new("storage/session.json");
+    let knowledge_txt = Path::new("storage/knowledge.txt");
+    let bert_model_path = Path::new("storage/model.safetensors");
+    let bert_config_path = Path::new("storage/config.json");
+    let tokenizer_path = Path::new("storage/tokenizer.json");
 
-            println!("Инициализация векторного реестра Базы Знаний...");
-            let mut registry = crate::storage::VectorRegistry::bootstrap(
-                knowledge_path,
-                &embed_files.weights,
-                &embed_files.config,
-                &embed_files.tokenizer,
-                &device,
-            )?;
+    let candle_cpu_device = candle_core::Device::Cpu;
 
-            let res = registry.find_relevant_context(prompt_str)?;
+    println!("Bootstrapping vector registration registry subsystem...");
+    let mut vector_registry = storage::VectorRegistry::bootstrap(
+        knowledge_txt,
+        bert_model_path,
+        bert_config_path,
+        tokenizer_path,
+        &candle_cpu_device,
+    ).context("Failed to bootstrap target VectorRegistry repository state")?;
 
-            res
-        };
+    let mut session = ChatSession::load_or_create(storage_dir)?;
 
-        let system_instruction = "You are a helpful local AI assistant. If the provided knowledge base context contains information regarding the user's question, prioritize using it for an accurate answer. If there is no context or the context lacks information, answer to the best of your own general knowledge.";
-
-        let execution_prompt = if let Some(ref facts) = context_info {
-            println!("Context found, length: {}", facts.len());
-            format!(
-                "<|im_start|>system\n{} Here is the context from the knowledge base:\n{}\n<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-                system_instruction,
-                facts,
-                prompt_str
-            )
+    // --- Step 3: Extract User Input from CLI Arguments ---
+    let prompt_arg = if let Some(pos) = args.iter().position(|x| x == "--prompt") {
+        if pos + 1 < args.len() {
+            args[pos + 1].as_str()
         } else {
-            println!("Context NOT found, using model's free thinking");
-            format!(
-                "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-                system_instruction,
-                prompt_str
-            )
-        };
+            anyhow::bail!("CLI Error: Missing text payload after --prompt flag");
+        }
+    } else {
+        anyhow::bail!("CLI Error: No prompt provided. Use the --prompt flag to submit your query.");
+    };
 
-        println!("Текст execution_prompt полностью:\n---\n{}\n---", execution_prompt);
-        
-        session.add_message("user", prompt_str);
+    let prompt_str = prompt_arg.trim();
+    if prompt_str.is_empty() {
+        anyhow::bail!("CLI Error: Submitted prompt parameter is completely empty");
+    }
 
-        println!("Передаем управление в engine.generate...");
-        // Запускаем движок генерации
-        if let Err(e) = engine.generate(&mut session, &execution_prompt, &tokenizer) {
-            println!("Ошибка генерации: {:?}", e);
-        } else {
-            // Сбрасываем сдвиг позиций и сохраняем чистую историю диалога
-            session.pos_offset = 0;
-            session.save(history_path)?;
+    // --- Step 4: Context Extraction (Mocked) ---
+    let context_info = vector_registry.find_relevant_context(prompt_str)?;
+
+    let system_instruction = "You are a helpful local AI assistant. If the context contains relevant information regarding the user's question, prioritize using it for an accurate answer. If there is no context or the context lacks information, answer to the best of your own general knowledge.";
+
+
+    session.add_message("user", prompt_str);
+
+    let mut history_context = String::new();
+    for msg in &session.messages {
+        history_context.push_str(&format!(
+            "<|im_start|>{}\n{}<|im_end|>\n",
+            msg.role,
+            msg.content
+        ));
+    };
+
+    // Assemble the single unified prompt architecture matching ChatML specifications
+    let execution_prompt = if let Some(ref facts) = context_info {
+        println!("Context extraction found, payload size: {} chars", facts.len());
+        format!(
+            "<|im_start|>system\n{} Here is the context from the knowledge base:\n{}\n<|im_end|>\n{}<|im_start|>assistant\n",
+            system_instruction,
+            facts,
+            history_context
+        )
+    } else {
+        println!("Context lookup empty, utilizing pure model generation capabilities");
+        format!(
+            "<|im_start|>system\n{}<|im_end|>\n{}<|im_start|>assistant\n",
+            system_instruction,
+            history_context
+        )
+    };
+
+    // --- DEBUG PROMPT INJECTION START ---
+    println!("\n[DEBUG] === FULL TEXT SENT TO LLAMA.CPP ===");
+    println!("{}", execution_prompt);
+    println!("[DEBUG] ===================================\n");
+    // --- DEBUG PROMPT INJECTION END ---
+
+    print!("Assistant: ");
+    std::io::stdout().flush()?;
+
+    // --- Step 5: Trigger Unified Execution via llama.cpp Core ---
+    if let Err(e) = engine.generate(&execution_prompt, &mut session) {
+        println!("Generation sequence encountered an error: {:?}", e);
+    } else {
+        // Persist state updates to disk before application lifecycle termination
+        if let Err(e) = session.save(storage_dir) {
+            println!("Warning: Failed to flush chat history session to state ledger: {:?}", e);
         }
     }
 
