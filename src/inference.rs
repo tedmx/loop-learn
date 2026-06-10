@@ -90,15 +90,19 @@ impl InferenceEngine {
             .map(|c| c.id().0)
             .unwrap_or(0);
 
-        let mut decoder = encoding_rs::UTF_8.new_decoder_without_bom_handling();
-
+        let mut token_count = 0;
         // Single linear autoregressive generation loop
         loop {
             if next_token_id == preset.eos_token as i32 {
                 break;
             }
+            if token_count >= preset.max_tokens {
+                break;
+            }
 
             let next_token = LlamaToken(next_token_id);
+
+            let mut decoder = encoding_rs::UTF_8.new_decoder_without_bom_handling();
             
             if let Ok(token_text) = self.model.token_to_piece(
                 next_token, 
@@ -131,6 +135,8 @@ impl InferenceEngine {
                 .max_by(|a, b| a.logit().partial_cmp(&b.logit()).unwrap())
                 .map(|c| c.id().0)
                 .unwrap_or(0);
+            
+            token_count += 1;
         }
 
         let clean_final_text = prev_text.replace("<br>", "\n");

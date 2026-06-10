@@ -18,7 +18,7 @@ If the context does not contain enough information to answer the question, use y
 but state clearly that the info was not found in the local database. Keep your answers factual and direct.";
 
 fn main() -> Result<()> {
-    println!("[VERSION] 15\n");
+    println!("[DEBUG] v16\n");
 
     let args: Vec<String> = std::env::args().collect();
 
@@ -240,6 +240,10 @@ fn main() -> Result<()> {
                 std::io::stdout().flush()?;
                 Ok(())
             })?;
+
+            if let Err(e) = session.save(storage_dir) {
+                println!("Warning: Failed to auto-save session: {:?}", e);
+            }
         }
     }
 
