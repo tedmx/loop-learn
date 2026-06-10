@@ -235,7 +235,7 @@ impl VectorRegistry {
         println!("Closest knowledge chunk located with similarity score: {:.4}", best_score);
         
         // Match against a safety threshold to prevent injecting irrelevant data
-        if best_score > 0.30 {
+        if best_score > 0.60 {
             if best_text.is_some() {
                 println!("Context successfully extracted and verified for LLM context injection.");
             }

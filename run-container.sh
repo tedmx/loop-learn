@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Target Docker image name
-IMAGE_NAME="loop-learn-app"
+IMAGE_NAME="loop-learn"
 
 # Check if local image exists. If not — trigger build sequence
 if ! docker images --format "{{.Repository}}" | grep -q "^${IMAGE_NAME}$"; then
@@ -19,7 +19,9 @@ echo "=== Launching loop-learn engine inside isolated container... ==="
 mkdir -p storage;
 
 # Run container with hardware routing, active HF_TOKEN, and host-mapped cache paths
-docker run -it --rm --gpus all -e HF_TOKEN \
-  -v "$(pwd)/storage:/usr/src/loop-learn/storage" \
-  -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
-  loop-learn-app:latest cargo run --release -- "$@"
+docker run -it --rm \
+    --gpus all \
+    -e HF_TOKEN \
+    -v "$(pwd)/storage:/usr/src/loop-learn/storage" \
+    -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+    "$IMAGE_NAME":latest "$@"
