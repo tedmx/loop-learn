@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use candle_core::Device;
 use std::path::Path;
 use std::io::Write;
 
@@ -82,20 +83,7 @@ fn main() -> Result<()> {
 
     println!("Bootstrapping vector registration registry subsystem...");
 
-    // Attempt to instantiate a native CUDA device context inside WSL, fallback to CPU if unavailable
-    let candle_device = if candle_core::utils::cuda_is_available() {
-        println!("[INFO] CUDA accelerator detected for Candle. Allocating memory on GPU 0...");
-        match candle_core::Device::new_cuda(0) {
-            Ok(dev) => dev,
-            Err(e) => {
-                println!("[ERROR] Candle failed to initialize CUDA device context: {:?}", e);
-                candle_core::Device::Cpu
-            }
-        }
-    } else {
-        println!("[WARN] CUDA not available to Candle environment. Falling back to host CPU execution.");
-        candle_core::Device::Cpu
-    };
+    let candle_device = Device::Cpu;
 
     let bert_model_path = Path::new("storage/model.safetensors");
     let bert_config_path = Path::new("storage/config.json");
@@ -164,7 +152,7 @@ fn main() -> Result<()> {
         print!("Assistant: ");
         std::io::stdout().flush()?;
 
-        let mut ctx = engine.new_context()?;
+        let mut ctx = engine.new_context(preset)?;
         if let Err(e) = engine.generate(&mut ctx, &execution_prompt, &mut session, preset, |token| {
             print!("{}", token);
             std::io::stdout().flush()?;
@@ -179,7 +167,7 @@ fn main() -> Result<()> {
         }
     } else {
         // Instantiate the persistent context workspace once before starting the chat loop
-        let mut ctx = engine.new_context()?;
+        let mut ctx = engine.new_context(preset)?;
 
         // Initialize rustyline editor helper instance
         let mut rl = rustyline::DefaultEditor::new()?;
@@ -247,7 +235,7 @@ fn main() -> Result<()> {
             print!("Assistant: ");
             std::io::stdout().flush()?;
 
-            engine.generate(&mut ctx, &formatted_prompt, &mut session, &preset, |token| {
+            engine.generate(&mut ctx, &formatted_prompt, &mut session, preset, |token| {
                 print!("{}", token);
                 std::io::stdout().flush()?;
                 Ok(())

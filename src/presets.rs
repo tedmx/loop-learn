@@ -11,6 +11,7 @@ pub struct PresetInfo {
     pub temperature: f64,
     pub top_p: f64,
     pub repetition_penalty: f32,
+    pub n_ctx: u32,        // размер контекста (токенов)
 }
 
 pub const PRESETS: &[PresetInfo] = &[
@@ -27,6 +28,7 @@ pub const PRESETS: &[PresetInfo] = &[
         temperature: 0.7,
         top_p: 0.9,
         repetition_penalty: 1.1,
+        n_ctx: 2048,
     },
     PresetInfo {
         name: "qwen-3b-q4",
@@ -39,6 +41,7 @@ pub const PRESETS: &[PresetInfo] = &[
         temperature: 0.7,
         top_p: 0.9,
         repetition_penalty: 1.1,
+        n_ctx: 2048,
     },
 
     // --- 12 GB VRAM Profiles (RTX 2060 Super) ---
@@ -70,6 +73,7 @@ pub const PRESETS: &[PresetInfo] = &[
         temperature: 0.7,
         top_p: 0.9,
         repetition_penalty: 1.1,
+        n_ctx: 4096,
     },
     // Phi-3 preset consumes MORE than 6 GB and produces Out-of-memory errors, unless we use complex technologies like Flash Attention. 
     PresetInfo {
@@ -83,6 +87,7 @@ pub const PRESETS: &[PresetInfo] = &[
         temperature: 0.7,
         top_p: 0.85,
         repetition_penalty: 1.1,
+        n_ctx: 4096,
     },
     PresetInfo {
         name: "qwen-14b-q4",
@@ -95,6 +100,7 @@ pub const PRESETS: &[PresetInfo] = &[
         temperature: 0.7,
         top_p: 0.9,
         repetition_penalty: 1.1,
+        n_ctx: 4096,
     },
 ];
 
