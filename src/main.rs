@@ -18,7 +18,7 @@ If the context does not contain enough information to answer the question, use y
 but state clearly that the info was not found in the local database. Keep your answers factual and direct.";
 
 fn main() -> Result<()> {
-    println!("[DEBUG] v16\n");
+    println!("[DEBUG] v17\n");
 
     let args: Vec<String> = std::env::args().collect();
 
@@ -159,6 +159,9 @@ fn main() -> Result<()> {
             Ok(())
         }) {
             println!("Generation sequence encountered an error: {:?}", e);
+            if let Err(save_err) = session.save(storage_dir) {
+                println!("Warning: Failed to save session after error: {:?}", save_err);
+            }
         } else {
             // Persist state updates to disk before application lifecycle termination
             if let Err(e) = session.save(storage_dir) {
@@ -200,6 +203,9 @@ fn main() -> Result<()> {
 
             // --- INLINE SYSTEM COMMANDS PROCESSING ---
             if input_trimmed == "/exit" {
+                if let Err(e) = session.save(storage_dir) {
+                    println!("Warning: Failed to save session on exit: {:?}", e);
+                }
                 println!("Exiting application cycle.");
                 break;
             }
@@ -207,6 +213,15 @@ fn main() -> Result<()> {
             if input_trimmed == "/clear" {
                 session.messages.clear();
                 println!("[System] Context history successfully flushed.");
+                continue;
+            }
+
+            if input_trimmed == "/save" {
+                if let Err(e) = session.save(storage_dir) {
+                    println!("Warning: Failed to save session: {:?}", e);
+                } else {
+                    println!("Session saved.");
+                }
                 continue;
             }
 
@@ -235,11 +250,17 @@ fn main() -> Result<()> {
             print!("Assistant: ");
             std::io::stdout().flush()?;
 
-            engine.generate(&mut ctx, &formatted_prompt, &mut session, preset, |token| {
+            if let Err(e) = engine.generate(&mut ctx, &formatted_prompt, &mut session, preset, |token| {
                 print!("{}", token);
                 std::io::stdout().flush()?;
                 Ok(())
-            })?;
+            }) {
+                println!("\nGeneration error: {:?}", e);
+                if let Err(save_err) = session.save(storage_dir) {
+                    println!("Warning: Failed to save session after error: {:?}", save_err);
+                }
+                break;
+            }
 
             if let Err(e) = session.save(storage_dir) {
                 println!("Warning: Failed to auto-save session: {:?}", e);
@@ -282,7 +303,7 @@ fn format_prompt(
                 )
             }
         }
-        "chatml" | _ => {
+        _ => {
             if !rag_marker.is_empty() {
                 format!(
                     "<|im_start|>system\n{}<|im_end|>\n{}{}\n<|im_start|>assistant\n",

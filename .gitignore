@@ -6,3 +6,4 @@ session.json
 embeddings.json
 tokenizer.json
 model.safetensors
+knowledge.mtime

@@ -11,7 +11,6 @@ use crate::presets::PresetInfo;
 pub struct InferenceEngine {
     model: LlamaModel,
     backend: LlamaBackend,
-    eos_token: u32,
 }
 
 impl InferenceEngine {
@@ -28,18 +27,15 @@ impl InferenceEngine {
         let model = LlamaModel::load_from_file(&backend, model_path, &model_params)
             .context("Failed to build LlamaModel structure from storage binary")?;
 
-        let eos_token = model.token_eos().0 as u32;
-
         Ok(Self {
             model,
             backend,
-            eos_token,
         })
     }
 
-    pub fn generate<F>(
+    pub fn generate<'a, F>(
         &self,
-        ctx: &mut llama_cpp_2::context::LlamaContext<'_>,
+        ctx: &mut llama_cpp_2::context::LlamaContext<'a>,
         prompt: &str,
         session: &mut ChatSession,
         preset: &crate::presets::PresetInfo,
@@ -75,7 +71,6 @@ impl InferenceEngine {
         current_pos += 1;
 
         let mut prev_text = String::new();
-        let mut generated_tokens = tokens_list.clone();
 
         // Extract the first token logits from the prompt residue before altering the batch
         let first_logit_idx = if batch.n_tokens() > 0 {
@@ -118,16 +113,11 @@ impl InferenceEngine {
                 prev_text.push_str(&token_text);
             }
 
-            generated_tokens.push(next_token);
-
             // Wipe prompt leftovers and stage exactly one token at index 0
             batch.clear();
             batch.add(next_token, current_pos, &[0], true)?;
             
-            if let Err(e) = ctx.decode(&mut batch) {
-                eprintln!("\n[ERROR-LOOP] Decode failed at pos {}: {:?}", current_pos, e);
-                break;
-            }
+            ctx.decode(&mut batch).context(format!("Decode failed at pos {}", current_pos))?;
 
             current_pos += 1;
 
@@ -141,7 +131,6 @@ impl InferenceEngine {
 
         let clean_final_text = prev_text.replace("<br>", "\n");
         session.add_message("assistant", clean_final_text.trim());
-        session.pos_offset = current_pos as usize;
 
         Ok(())
     }

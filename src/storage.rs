@@ -2,8 +2,9 @@ use serde::{Serialize, Deserialize};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::time::SystemTime;
 use anyhow::Result;
-use candle_transformers::models::bert::{BertModel};
+use candle_transformers::models::bert::{BertModel, Config};
 
 // Import necessary items from Candle ecosystem for vector operations
 use candle_core::{Tensor, Device, DType};
@@ -18,7 +19,6 @@ pub struct ChatMessage {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ChatSession {
     pub messages: Vec<ChatMessage>,
-    pub pos_offset: usize,
 }
 
 // Structure to store single indexed knowledge units
@@ -50,8 +50,9 @@ impl VectorRegistry {
         device: &Device,
     ) -> Result<Self> {
         let config_file = File::open(config_path)?;
-        // Simple placeholder decoding logic matching target configuration layout
-        let config = serde_json::from_reader(config_file)?;
+        let config: Config = serde_json::from_reader(config_file)?;
+
+        let hidden_size = config.hidden_size;
         
         let safetensors = unsafe { candle_core::safetensors::MmapedSafetensors::new(model_path)? };
         let vb = VarBuilder::from_backend(Box::new(safetensors), DType::F32, device.clone());
@@ -60,15 +61,38 @@ impl VectorRegistry {
         let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to initialize target embeddings tokenizer structure: {}", e))?;
 
-        let cache_path = Path::new("storage/embeddings.json");
         let mut documents = Vec::new();
 
-        if cache_path.exists() {
+        let cache_path = Path::new("storage/embeddings.json");
+        let mtime_path = Path::new("storage/knowledge.mtime");
+
+        let need_reindex = if let (true, true) = (cache_path.exists(), knowledge_path.exists()) {
+            let current_mtime = std::fs::metadata(knowledge_path)?.modified()?;
+            let stored_mtime = if mtime_path.exists() {
+                let content = std::fs::read_to_string(mtime_path)?;
+                let secs = content.parse::<u64>().unwrap_or(0);
+                SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs)
+            } else {
+                SystemTime::UNIX_EPOCH
+            };
+            current_mtime > stored_mtime
+        } else {
+            false
+        };
+
+        if cache_path.exists() && !need_reindex {
             println!("Loading pre-computed vector representations from local cache...");
             let cache_file = File::open(cache_path)?;
             let cached_docs: Vec<CachedDocument> = serde_json::from_reader(cache_file)?;
             
             for doc in cached_docs {
+                if doc.embedding_data.len() != hidden_size {
+                    anyhow::bail!(
+                        "Embedding dimension mismatch: cached {} vs model {}",
+                        doc.embedding_data.len(),
+                        hidden_size
+                    );
+                }
                 let tensor = Tensor::new(doc.embedding_data.as_slice(), device)?;
                 documents.push(KnowledgeDocument {
                     text: doc.text,
@@ -164,6 +188,10 @@ impl VectorRegistry {
             let json_bytes = serde_json::to_vec_pretty(&cache_to_save)?;
             file.write_all(&json_bytes)?;
             println!("Vector cache successfully flushed to disk.");
+
+            let current_mtime = std::fs::metadata(knowledge_path)?.modified()?;
+            let mtime_secs = current_mtime.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
+            std::fs::write(mtime_path, mtime_secs.to_string())?;
         } else {
             println!("Warning: Database resource path missing. Standby for empty execution context.");
         }
@@ -272,7 +300,6 @@ impl ChatSession {
             }
             return Ok(Self {
                 messages: Vec::new(),
-                pos_offset: 0,
             });
         }
 
